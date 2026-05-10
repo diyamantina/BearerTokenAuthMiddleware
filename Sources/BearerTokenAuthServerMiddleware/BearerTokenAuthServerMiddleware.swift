@@ -1,57 +1,36 @@
 import Foundation
 import Vapor
 
-/// Vapor server-side middleware that conditionally enforces bearer token
-/// presence based on ``AuthMode``, optionally runs a structural validation
-/// strategy against the token, and propagates the token via
-/// ``BearerTokenContext/token`` for downstream handlers.
+/// Vapor server-side middleware that conditionally enforces bearer token presence
+/// based on ``AuthMode``, optionally runs a structural validation strategy against
+/// the token, and propagates the token via ``BearerTokenContext/token`` for
+/// downstream handlers.
 ///
-/// ## Quick start
+/// ## Overview
 ///
 /// Single-line construction picks sensible defaults:
 ///
 ///     app.middleware.use(BearerTokenAuthServerMiddleware(mode: .jwt))
 ///
-/// That installs JWT shape validation, exempts the common health/ready
-/// endpoints, and rejects any protected-route request without a Bearer
-/// header. No further setup required to get a working baseline.
+/// That installs JWT shape validation, exempts the common health/ready endpoints,
+/// and rejects any protected-route request without a Bearer header. No further
+/// setup is required to get a working baseline.
 ///
-/// ## Error model
+/// In ``AuthMode/none`` the middleware is a passthrough. In ``AuthMode/uuid`` or
+/// ``AuthMode/jwt`` on a public route (`publicEndpoints` exact match, or under
+/// `publicPathPrefixes`) the middleware also passes through. Everywhere else it
+/// requires a bearer token; missing tokens throw
+/// ``BearerTokenAuthServerError/missingToken``, the configured ``ValidationStrategy``
+/// runs against present tokens and may throw ``BearerTokenAuthServerError/invalidToken``.
 ///
-/// - ``AuthMode/none``: never throws. Token (if any) is propagated to
-///   ``BearerTokenContext/token`` and the request continues.
-/// - ``AuthMode/uuid`` or ``AuthMode/jwt`` on a public route
-///   (`publicEndpoints` exact match, or under `publicPathPrefixes`):
-///   never throws. Same passthrough as ``AuthMode/none``.
-/// - ``AuthMode/uuid`` or ``AuthMode/jwt`` on a protected route:
-///   - **No usable token** → throws
-///     ``BearerTokenAuthServerError/missingToken``. Covers absent
-///     `Authorization` header, `Authorization: Bearer ` with empty
-///     value, and non-Bearer schemes (`Basic`, `Digest`, garbage).
-///   - **Token present, validation strategy rejects it** → throws
-///     ``BearerTokenAuthServerError/invalidToken``. (User-supplied
-///     ``ValidationStrategy/custom(_:)`` validators may instead throw
-///     any `Error`; it propagates unchanged.)
-///   - **Token accepted** → handler runs with the token in
-///     ``BearerTokenContext/token``.
+/// Real signature verification, JWT claim checks, and DB-session lookup belong in
+/// ``ValidationStrategy/custom(_:)`` because they need per-project keys / database
+/// access; the bundled ``ValidationStrategy/jwtShape`` and
+/// ``ValidationStrategy/uuidShape`` are shape-only.
 ///
-/// ## What the middleware does NOT do
-///
-/// - **JWT signature verification** — needs the signing key. Use
-///   ``ValidationStrategy/custom(_:)`` with JWTKit or similar.
-/// - **JWT `exp` / `nbf` / `iat` claim verification** — must happen
-///   together with signature verification (otherwise the claims are
-///   trivially forgeable). Same place: a `.custom` validator.
-/// - **UUID session liveness / expiry** — needs DB access. Same place.
-///
-/// The bundled ``ValidationStrategy/jwtShape`` is **shape-only** and does
-/// not provide any security guarantees beyond "this looks like a JWT."
-/// Same for ``ValidationStrategy/uuidShape``.
-///
-/// ## Path-prefix matching
-///
-/// Boundary-anchored: `["/admin"]` and `["/admin/"]` both match `/admin`
-/// and `/admin/anything` but neither matches `/administrator`.
+/// - Important: Path-prefix matching is boundary-anchored. `["/admin"]` and
+///   `["/admin/"]` both match `/admin` and `/admin/anything` but neither matches
+///   `/administrator`.
 ///
 /// ## Topics
 ///
@@ -70,28 +49,55 @@ import Vapor
 public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
 
     /// User-supplied closure type for ``ValidationStrategy/custom(_:)``.
-    /// Receives the raw bearer token (without the "Bearer " prefix).
-    /// Throwing rejects the request; returning normally allows it.
+    ///
+    /// Receives the raw bearer token (without the `Bearer ` prefix). Throwing
+    /// rejects the request; returning normally allows it.
     public typealias Validator = @Sendable (String) async throws -> Void
 
     /// What to do with a bearer token after presence checks pass.
+    ///
+    /// ## Topics
+    ///
+    /// ### Strategies
+    /// - ``auto``
+    /// - ``none``
+    /// - ``jwtShape``
+    /// - ``uuidShape``
+    /// - ``custom(_:)``
     public enum ValidationStrategy: Sendable {
-        /// Auto-pick based on `AuthMode`: `.uuid` → `.uuidShape`,
-        /// `.jwt` → `.jwtShape`, `.none` → `.none`.
+
+        /// Pick based on ``AuthMode``: `.uuid` → ``uuidShape``,
+        /// `.jwt` → ``jwtShape``, `.none` → ``none``. The default.
         case auto
 
-        /// Skip validation entirely. The only thrown case becomes
-        /// ``BearerTokenAuthServerError/missingToken``.
+        /// Skip validation entirely.
+        ///
+        /// The only thrown case becomes ``BearerTokenAuthServerError/missingToken``.
         case none
+
+        /// Token must look like a JWT — three non-empty Base64URL segments separated
+        /// by `.`.
+        ///
+        /// - Note: Does NOT verify the signature; that needs the signing key. Use
+        ///   ``custom(_:)`` with a JWT library (JWTKit, jose-swift) for full
+        ///   verification including `exp`, `iat`, `nbf`, and audience checks.
         case jwtShape
+
+        /// Token must be a canonical 8-4-4-4-12 UUID string (case-insensitive).
         case uuidShape
+
+        /// User-supplied validator.
+        ///
+        /// The right place for DB session lookup, JWT signature + claim
+        /// verification, expiry checks, etc.
         case custom(Validator)
     }
 
-    /// Default set of paths exempted from auth enforcement. Health and
-    /// readiness probes (Vapor + Kubernetes conventions) plus `/metrics`.
-    /// Override by passing your own set; pass an empty set to require
-    /// auth on every endpoint.
+    /// Default set of paths exempted from auth enforcement.
+    ///
+    /// Health and readiness probes (Vapor + Kubernetes conventions) plus `/metrics`.
+    /// Pass an empty set to ``init(mode:publicEndpoints:publicPathPrefixes:validation:)``
+    /// to require auth on every endpoint.
     public static let defaultPublicEndpoints: Set<String> = [
         "/health",
         "/healthz",
@@ -105,16 +111,16 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     private let normalizedPublicPathPrefixes: Set<String>
     private let validation: ValidationStrategy
 
+    /// Creates a new middleware.
+    ///
     /// - Parameters:
-    ///   - mode: Active authentication mode. Default ``AuthMode/none``.
-    ///   - publicEndpoints: Exact paths that bypass enforcement. Defaults
-    ///     to ``defaultPublicEndpoints`` (health/ready/metrics).
-    ///   - publicPathPrefixes: Path prefixes whose subtree bypasses
-    ///     enforcement. Boundary-anchored. Default empty.
-    ///   - validation: ``ValidationStrategy`` to apply after presence
-    ///     check passes. Default ``ValidationStrategy/auto`` — picks
-    ///     based on `mode`. Pass ``ValidationStrategy/none`` to opt out
-    ///     of validation entirely even on a non-`.none` mode.
+    ///   - mode: Active authentication mode. Defaults to ``AuthMode/none``.
+    ///   - publicEndpoints: Exact paths that bypass enforcement. Defaults to
+    ///     ``defaultPublicEndpoints`` (health/ready/metrics).
+    ///   - publicPathPrefixes: Path prefixes whose subtree bypasses enforcement.
+    ///     Boundary-anchored. Default empty.
+    ///   - validation: ``ValidationStrategy`` to apply after presence check passes.
+    ///     Default ``ValidationStrategy/auto``.
     public init(
         mode: AuthMode = .none,
         publicEndpoints: Set<String> = BearerTokenAuthServerMiddleware.defaultPublicEndpoints,
@@ -172,7 +178,7 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
 
     private func applyValidation(to token: String) async throws {
         switch validation {
-        case .auto, .none:           return  // .auto already resolved in init
+        case .auto, .none:           return
         case .jwtShape:              try Self.validateJWTShape(token)
         case .uuidShape:             try Self.validateUUIDShape(token)
         case .custom(let validator): try await validator(token)

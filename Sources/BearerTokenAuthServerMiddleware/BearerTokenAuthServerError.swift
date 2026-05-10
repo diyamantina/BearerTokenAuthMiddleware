@@ -4,35 +4,19 @@ import Vapor
 ///
 /// ## Overview
 ///
-/// Two cases:
+/// Both cases conform to `AbortError` so Vapor automatically translates them to
+/// HTTP 401 with reason `"Unauthorized"`. The external response is identical for
+/// both cases — per OWASP guidance, the server does not leak which sub-failure
+/// tripped to a hostile caller. Tests, instrumentation, and structured logging can
+/// still pattern-match on the typed case for richer signal.
 ///
-/// - ``missingToken`` — the request had no usable bearer token on a
-///   protected route. Covers absent `Authorization` header,
-///   `Authorization: Bearer ` with empty value, and non-Bearer schemes
-///   (`Basic ...`, `Digest ...`, garbage).
-/// - ``invalidToken`` — a token was present but the configured
-///   ``BearerTokenAuthServerMiddleware/ValidationStrategy`` rejected it
-///   (wrong shape, signature mismatch from a `.custom` validator, etc.).
-///
-/// ## HTTP translation
-///
-/// Both cases conform to `AbortError` so Vapor automatically translates
-/// them to **HTTP 401 with reason `"Unauthorized"`**. The external reason
-/// is intentionally identical for both cases (OWASP guidance — do not
-/// leak which sub-failure tripped to a hostile caller).
-///
-/// Tests, instrumentation, and structured logging can still pattern-match
-/// the typed case for richer signal.
-///
-/// ## Mapping back to user input
-///
-/// | Caller sent                                | Thrown            |
-/// |--------------------------------------------|-------------------|
-/// | nothing on `Authorization`                 | ``missingToken``  |
-/// | `Authorization: Bearer ` (empty value)     | ``missingToken``  |
-/// | `Authorization: Basic ...` / Digest / etc. | ``missingToken``  |
-/// | `Authorization: Bearer <bad-shape>`        | ``invalidToken``  |
-/// | `Authorization: Bearer <good-shape>`       | (no error)        |
+/// | Caller sent | Thrown |
+/// |---|---|
+/// | nothing on `Authorization` | ``missingToken`` |
+/// | `Authorization: Bearer ` (empty value) | ``missingToken`` |
+/// | `Authorization: Basic ...` / Digest / etc. | ``missingToken`` |
+/// | `Authorization: Bearer <bad-shape>` | ``invalidToken`` |
+/// | `Authorization: Bearer <good-shape>` | (no error) |
 ///
 /// ## Topics
 ///
@@ -40,15 +24,23 @@ import Vapor
 /// - ``missingToken``
 /// - ``invalidToken``
 ///
-/// ### AbortError conformance
+/// ### `AbortError` conformance
 /// - ``status``
 /// - ``reason``
 public enum BearerTokenAuthServerError: Error, AbortError, Equatable {
 
     /// No usable bearer token on a protected request.
+    ///
+    /// Covers absent `Authorization` header, `Authorization: Bearer ` with empty
+    /// value, and non-Bearer schemes (`Basic ...`, `Digest ...`, garbage).
     case missingToken
 
     /// A bearer token was present but the validation strategy rejected it.
+    ///
+    /// The bundled ``BearerTokenAuthServerMiddleware/ValidationStrategy/jwtShape``
+    /// and ``BearerTokenAuthServerMiddleware/ValidationStrategy/uuidShape`` produce
+    /// this on shape mismatch; ``BearerTokenAuthServerMiddleware/ValidationStrategy/custom(_:)``
+    /// validators may produce this case or any other `Error` of their choosing.
     case invalidToken
 
     public var status: HTTPResponseStatus { .unauthorized }
