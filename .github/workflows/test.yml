@@ -6,6 +6,21 @@ on:
   pull_request:
     branches: [main]
 
+# Five-platform CI matrix:
+#
+#   - Linux   (Swift 6.0 container)            — full swift build + test
+#                                                (both products compile and
+#                                                 every test passes)
+#   - macOS   (latest)                         — full swift build + test
+#   - iOS     (Simulator, xcodebuild build)    — client product only
+#   - tvOS    (Simulator, xcodebuild build)    — client product only
+#   - watchOS (Simulator, xcodebuild build)    — client product only
+#
+# `BearerTokenAuthServerMiddleware` depends on Vapor, which does not ship
+# for iOS / tvOS / watchOS, so the simulator rows build the client product
+# (`BearerTokenAuthMiddleware`) and not the server product. SPM tests do
+# not run on those platforms without a host app anyway.
+
 jobs:
   linux:
     name: Swift ${{ matrix.swift }} on Linux
@@ -18,17 +33,29 @@ jobs:
       image: swift:${{ matrix.swift }}
     steps:
       - uses: actions/checkout@v4
-      - name: swift build
-        run: swift build
-      - name: swift test
-        run: swift test --parallel
+      - run: swift build
+      - run: swift test --parallel
 
   macos:
     name: Swift on macOS
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: swift build
-        run: swift build
-      - name: swift test
-        run: swift test --parallel
+      - run: swift build
+      - run: swift test --parallel
+
+  apple-platforms:
+    name: ${{ matrix.platform }} build verification (client product)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ["iOS Simulator", "tvOS Simulator", "watchOS Simulator"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: xcodebuild build (${{ matrix.platform }})
+        run: |
+          xcodebuild -scheme BearerTokenAuthMiddleware \
+            -destination 'generic/platform=${{ matrix.platform }}' \
+            -skipPackagePluginValidation \
+            build

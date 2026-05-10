@@ -4,9 +4,27 @@ import PackageDescription
 
 let package = Package(
     name: "BearerTokenAuthMiddleware",
+    // Supported platforms per product (CI verifies all of them):
+    //
+    //   BearerTokenAuthMiddleware       (client; pure OpenAPIRuntime)
+    //     - macOS 13+    full swift build + test
+    //     - iOS 16+      xcodebuild build verification
+    //     - tvOS 16+     xcodebuild build verification
+    //     - watchOS 9+   xcodebuild build verification
+    //     - Linux        Swift 6.0 container, full swift build + test
+    //
+    //   BearerTokenAuthServerMiddleware (server; Vapor AsyncMiddleware)
+    //     - macOS 13+    full swift build + test
+    //     - Linux        Swift 6.0 container, full swift build + test
+    //     (Vapor itself does not ship for iOS/tvOS/watchOS — those iOS-style
+    //      build jobs only verify the client product compiles. SPM's
+    //      `platforms:` array applies package-wide, so the floor is what the
+    //      client product needs.)
     platforms: [
         .macOS(.v13),
-        .iOS(.v16)
+        .iOS(.v16),
+        .tvOS(.v16),
+        .watchOS(.v9)
     ],
     products: [
         .library(
