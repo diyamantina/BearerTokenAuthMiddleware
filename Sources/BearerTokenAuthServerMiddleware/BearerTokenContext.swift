@@ -32,6 +32,16 @@ import Foundation
 ///   visible to every async handler executed during that request and is automatically
 ///   cleared when the closure returns.
 ///
+/// - Important: Task-locals propagate through structured concurrency only. A
+///   handler that spawns a `Task.detached { ... }` (or pushes work onto a
+///   `DispatchQueue` / explicit `Thread`) **does not** inherit ``token``; the
+///   detached scope sees `nil`. Use a non-detached `Task { ... }` if you need
+///   the token in async background work the handler kicks off, or capture the
+///   value into a local before crossing the boundary:
+///
+///       let token = BearerTokenContext.token
+///       Task.detached { use(token) }
+///
 /// ## Topics
 ///
 /// ### Reading the current token

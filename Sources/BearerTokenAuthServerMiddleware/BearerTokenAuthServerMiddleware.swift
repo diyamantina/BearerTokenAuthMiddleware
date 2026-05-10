@@ -32,6 +32,16 @@ import Vapor
 ///   `["/admin/"]` both match `/admin` and `/admin/anything` but neither matches
 ///   `/administrator`.
 ///
+/// - Warning: On routes covered by `publicEndpoints` or `publicPathPrefixes`
+///   the middleware does not enforce token presence, but it **still**
+///   propagates whatever token the caller sent into ``BearerTokenContext/token``
+///   for downstream handlers. If a downstream logger captures request headers
+///   (e.g. `OpenAPILoggingMiddleware` with a permissive `BodyLoggingPolicy`),
+///   valid bearer tokens can land in log files via public-endpoint requests.
+///   Mitigations: use `BodyLoggingPolicy.never`, redact the `Authorization`
+///   header in a custom `LogHandler`, or skip logging inside public-endpoint
+///   handlers entirely.
+///
 /// ## Topics
 ///
 /// ### Configuring the middleware
