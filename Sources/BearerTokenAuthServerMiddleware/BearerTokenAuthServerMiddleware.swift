@@ -15,14 +15,20 @@ import Vapor
 ///   propagated via `BearerTokenContext.token` if the caller sent one, so
 ///   handlers may opt into reading it.
 /// - ``AuthMode/uuid`` / ``AuthMode/jwt`` — require a bearer token on every
-///   request whose path is not in `publicEndpoints` and does not start with
-///   any prefix in `publicPathPrefixes`. Missing or oversized tokens are
-///   rejected with HTTP 401 (generic message per OWASP, no leak about
-///   which mode failed).
+///   request whose path is not in `publicEndpoints` and is not under any
+///   path component listed in `publicPathPrefixes`. Missing or oversized
+///   tokens are rejected with HTTP 401 (generic message per OWASP, no leak
+///   about which mode failed).
+///
+/// **Path-prefix matching is boundary-anchored.** `["/admin"]` and
+/// `["/admin/"]` both match `/admin` and `/admin/anything` but neither
+/// matches `/administrator`. Trailing slashes in the configured prefix are
+/// normalised away, so the two forms are interchangeable.
 public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     private let authMode: AuthMode
     private let publicEndpoints: Set<String>
-    private let publicPathPrefixes: Set<String>
+    /// Stored without trailing slash, never empty.
+    private let normalizedPublicPathPrefixes: Set<String>
     private let maxTokenLength: Int
 
     /// - Parameters:
@@ -31,8 +37,11 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     ///   - publicEndpoints: Exact paths that bypass enforcement (login,
     ///     health probes, etc.). Default empty.
     ///   - publicPathPrefixes: Path prefixes whose subtree bypasses
-    ///     enforcement (admin UI mounted under its own auth, static asset
-    ///     prefixes). Default empty.
+    ///     enforcement. Matched at path-component boundary, so `"/admin"`
+    ///     and `"/admin/"` both match `/admin` and `/admin/x` but neither
+    ///     matches `/administrator`. Empty prefixes are filtered out at
+    ///     init (an empty prefix would match all paths and is almost
+    ///     always a configuration mistake).
     ///   - maxTokenLength: Reject tokens longer than this to avoid
     ///     allocating unbounded headers. Default `4096`.
     public init(
@@ -43,7 +52,11 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     ) {
         self.authMode = mode
         self.publicEndpoints = publicEndpoints
-        self.publicPathPrefixes = publicPathPrefixes
+        self.normalizedPublicPathPrefixes = Set(
+            publicPathPrefixes
+                .map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 }
+                .filter { !$0.isEmpty }
+        )
         self.maxTokenLength = maxTokenLength
     }
 
@@ -62,9 +75,7 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
 
         // Public route under any auth mode: passthrough; propagate if present.
         let path = request.url.path
-        if publicEndpoints.contains(path)
-            || publicPathPrefixes.contains(where: { path.hasPrefix($0) })
-        {
+        if publicEndpoints.contains(path) || matchesPublicPrefix(path: path) {
             return try await BearerTokenContext.$token.withValue(token) {
                 try await next.respond(to: request)
             }
@@ -80,5 +91,18 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
         return try await BearerTokenContext.$token.withValue(token) {
             try await next.respond(to: request)
         }
+    }
+
+    /// Boundary-anchored prefix match against the normalised set.
+    /// Each stored prefix has no trailing slash and is non-empty.
+    /// `path` matches `prefix` iff `path == prefix` or `path` starts
+    /// with `prefix + "/"`.
+    private func matchesPublicPrefix(path: String) -> Bool {
+        for prefix in normalizedPublicPathPrefixes {
+            if path == prefix || path.hasPrefix(prefix + "/") {
+                return true
+            }
+        }
+        return false
     }
 }

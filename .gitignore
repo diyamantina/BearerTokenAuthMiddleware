@@ -44,4 +44,6 @@ fastlane/test_output
 
 # Custom folders used in ExtremePackaging
 Stage/
-Tasks/.build/.claude/
+Tasks/.build/
+.claude/
+CLAUDE.md

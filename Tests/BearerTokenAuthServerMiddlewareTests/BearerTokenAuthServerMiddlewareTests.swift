@@ -236,3 +236,201 @@ struct BearerTokenAuthServerMiddlewareTests {
         try await app.asyncShutdown()
     }
 }
+
+// MARK: - Path-prefix boundary safety (hardened matcher)
+
+@Suite("Path-prefix boundary matching")
+struct PathPrefixBoundaryTests {
+
+    /// Same harness as the main suite, but factored out so the boundary
+    /// tests can run in isolation.
+    private func makeApp(prefixes: Set<String>) async throws -> Application {
+        let app = try await Application.make(.testing)
+        app.middleware.use(
+            BearerTokenAuthServerMiddleware(
+                mode: .uuid,
+                publicPathPrefixes: prefixes
+            )
+        )
+        app.get("admin") { _ in "ok" }
+        app.get("admin", "page") { _ in "ok" }
+        app.get("administrator") { _ in "ok" }
+        app.get("admins", "list") { _ in "ok" }
+        return app
+    }
+
+    @Test("prefix `/admin` matches `/admin` exactly")
+    func exactMatch() async throws {
+        let app = try await makeApp(prefixes: ["/admin"])
+        try await app.testing().test(.GET, "admin") { res async in
+            #expect(res.status == .ok)
+        }
+        try await app.asyncShutdown()
+    }
+
+    @Test("prefix `/admin` matches `/admin/page` (path component boundary)")
+    func componentBoundaryMatch() async throws {
+        let app = try await makeApp(prefixes: ["/admin"])
+        try await app.testing().test(.GET, "admin/page") { res async in
+            #expect(res.status == .ok)
+        }
+        try await app.asyncShutdown()
+    }
+
+    @Test("prefix `/admin` does NOT match `/administrator` (security regression guard)")
+    func doesNotMatchSiblingNamespace() async throws {
+        let app = try await makeApp(prefixes: ["/admin"])
+        try await app.testing().test(.GET, "administrator") { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.asyncShutdown()
+    }
+
+    @Test("prefix `/admin` does NOT match `/admins/list` (similar path, different component)")
+    func doesNotMatchPluralNamespace() async throws {
+        let app = try await makeApp(prefixes: ["/admin"])
+        try await app.testing().test(.GET, "admins/list") { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.asyncShutdown()
+    }
+
+    @Test("prefix `/admin/` (trailing slash) behaves identically to `/admin`")
+    func trailingSlashEquivalent() async throws {
+        let app = try await makeApp(prefixes: ["/admin/"])
+        try await app.testing().test(.GET, "admin") { res async in
+            #expect(res.status == .ok)
+        }
+        try await app.testing().test(.GET, "admin/page") { res async in
+            #expect(res.status == .ok)
+        }
+        try await app.testing().test(.GET, "administrator") { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.asyncShutdown()
+    }
+}
+
+// MARK: - Non-Bearer Authorization schemes treated as missing
+
+@Suite("Non-Bearer Authorization schemes")
+struct NonBearerAuthorizationTests {
+
+    private func makeApp() async throws -> Application {
+        let app = try await Application.make(.testing)
+        app.middleware.use(BearerTokenAuthServerMiddleware(mode: .uuid))
+        app.get("probe") { _ in "ok" }
+        return app
+    }
+
+    @Test("`Authorization: Basic abc` is treated as missing (rejected on protected route)")
+    func basicAuthRejected() async throws {
+        let app = try await makeApp()
+        try await app.testing().test(
+            .GET,
+            "probe",
+            beforeRequest: { req in
+                req.headers.replaceOrAdd(name: .authorization, value: "Basic dXNlcjpwYXNz")
+            }
+        ) { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.asyncShutdown()
+    }
+
+    @Test("`Authorization: Digest ...` is treated as missing")
+    func digestAuthRejected() async throws {
+        let app = try await makeApp()
+        try await app.testing().test(
+            .GET,
+            "probe",
+            beforeRequest: { req in
+                req.headers.replaceOrAdd(name: .authorization, value: "Digest username=\"x\"")
+            }
+        ) { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.asyncShutdown()
+    }
+
+    @Test("garbage Authorization header is treated as missing")
+    func garbageAuthRejected() async throws {
+        let app = try await makeApp()
+        try await app.testing().test(
+            .GET,
+            "probe",
+            beforeRequest: { req in
+                req.headers.replaceOrAdd(name: .authorization, value: "totally-not-a-scheme")
+            }
+        ) { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.asyncShutdown()
+    }
+}
+
+// MARK: - Methods other than GET
+
+@Suite("HTTP methods")
+struct HTTPMethodTests {
+
+    actor TokenRecorder {
+        private(set) var seen: String?
+        func record(_ value: String?) { seen = value }
+    }
+
+    private func makeApp(mode: AuthMode = .uuid) async throws -> (Application, TokenRecorder) {
+        let app = try await Application.make(.testing)
+        let recorder = TokenRecorder()
+        app.middleware.use(BearerTokenAuthServerMiddleware(mode: mode))
+        for method in [HTTPMethod.GET, .POST, .PUT, .PATCH, .DELETE] {
+            app.on(method, "thing") { _ -> String in
+                await recorder.record(BearerTokenContext.token)
+                return "ok"
+            }
+        }
+        return (app, recorder)
+    }
+
+    @Test("POST is rejected without token, accepted with token", arguments: [
+        ("POST",  HTTPMethod.POST),
+        ("PUT",   HTTPMethod.PUT),
+        ("PATCH", HTTPMethod.PATCH),
+        ("DELETE",HTTPMethod.DELETE),
+    ])
+    func nonGETMethodsEnforce(_ name: String, _ method: HTTPMethod) async throws {
+        let (app, recorder) = try await makeApp()
+        try await app.testing().test(method, "thing") { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.testing().test(
+            method,
+            "thing",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "t-\(name)") }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+        await #expect(recorder.seen == "t-\(name)")
+        try await app.asyncShutdown()
+    }
+}
+
+@Suite("Path-prefix init normalization")
+struct PathPrefixNormalizationTests {
+
+    @Test("empty prefix is filtered out (does not match every path)")
+    func emptyPrefixFiltered() async throws {
+        let app = try await Application.make(.testing)
+        app.middleware.use(
+            BearerTokenAuthServerMiddleware(
+                mode: .uuid,
+                publicPathPrefixes: ["", "/", "/public"]
+            )
+        )
+        app.get("anything") { _ in "ok" }
+        try await app.testing().test(.GET, "anything") { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.asyncShutdown()
+    }
+}
