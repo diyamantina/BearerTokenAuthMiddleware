@@ -24,7 +24,8 @@ struct BearerTokenAuthServerMiddlewareTests {
         mode: AuthMode = .none,
         publicEndpoints: Set<String>? = nil,
         publicPathPrefixes: Set<String> = [],
-        validation: BearerTokenAuthServerMiddleware.ValidationStrategy = .auto
+        validation: BearerTokenAuthServerMiddleware.ValidationStrategy = .auto,
+        propagateTokenOnPublicRoutes: Bool = false
     ) async throws -> (Application, TokenRecorder) {
         let app = try await Application.make(.testing)
         let recorder = TokenRecorder()
@@ -35,14 +36,16 @@ struct BearerTokenAuthServerMiddlewareTests {
                 mode: mode,
                 publicEndpoints: publicEndpoints,
                 publicPathPrefixes: publicPathPrefixes,
-                validation: validation
+                validation: validation,
+                propagateTokenOnPublicRoutes: propagateTokenOnPublicRoutes
             )
         } else {
             // Use the defaults
             mw = BearerTokenAuthServerMiddleware(
                 mode: mode,
                 publicPathPrefixes: publicPathPrefixes,
-                validation: validation
+                validation: validation,
+                propagateTokenOnPublicRoutes: propagateTokenOnPublicRoutes
             )
         }
         app.middleware.use(mw)
@@ -68,9 +71,27 @@ struct BearerTokenAuthServerMiddlewareTests {
         try await app.asyncShutdown()
     }
 
-    @Test(".none mode propagates the token if one is present")
-    func nonePropagatesPresentToken() async throws {
+    @Test(".none mode does NOT propagate inbound token by default")
+    func noneDoesNotPropagateByDefault() async throws {
+        // Secure default: .none mode is functionally a fully-public deployment,
+        // so the inbound bearer token is not surfaced to handlers / loggers.
         let (app, recorder) = try await makeApp(mode: .none)
+        try await app.testing().test(
+            .GET, "probe",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "tok-1") }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+        await #expect(recorder.seen == nil)
+        try await app.asyncShutdown()
+    }
+
+    @Test(".none mode propagates the inbound token when propagateTokenOnPublicRoutes = true")
+    func nonePropagatesWhenOptedIn() async throws {
+        let (app, recorder) = try await makeApp(
+            mode: .none,
+            propagateTokenOnPublicRoutes: true
+        )
         try await app.testing().test(
             .GET, "probe",
             beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "tok-1") }
@@ -199,6 +220,93 @@ struct BearerTokenAuthServerMiddlewareTests {
         try await app.testing().test(.GET, "admin/page") { res async in
             #expect(res.status == .ok)
         }
+        try await app.asyncShutdown()
+    }
+
+    // MARK: - propagateTokenOnPublicRoutes (default false vs true)
+
+    @Test("public endpoint hit with token: default does NOT propagate token")
+    func publicEndpointDoesNotPropagateByDefault() async throws {
+        let (app, recorder) = try await makeApp(
+            mode: .uuid,
+            publicEndpoints: ["/public"]
+        )
+        try await app.testing().test(
+            .GET, "public",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "leak-me") }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+        await #expect(recorder.seen == nil)
+        try await app.asyncShutdown()
+    }
+
+    @Test("public endpoint hit with token: opt-in propagation surfaces the token")
+    func publicEndpointPropagatesWhenOptedIn() async throws {
+        let (app, recorder) = try await makeApp(
+            mode: .uuid,
+            publicEndpoints: ["/public"],
+            propagateTokenOnPublicRoutes: true
+        )
+        try await app.testing().test(
+            .GET, "public",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "leak-me") }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+        await #expect(recorder.seen == "leak-me")
+        try await app.asyncShutdown()
+    }
+
+    @Test("public path-prefix hit with token: default does NOT propagate")
+    func publicPathPrefixDoesNotPropagateByDefault() async throws {
+        let (app, recorder) = try await makeApp(
+            mode: .uuid,
+            publicPathPrefixes: ["/admin/"]
+        )
+        try await app.testing().test(
+            .GET, "admin/page",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "leak-me") }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+        await #expect(recorder.seen == nil)
+        try await app.asyncShutdown()
+    }
+
+    @Test("public path-prefix hit with token: opt-in propagation surfaces the token")
+    func publicPathPrefixPropagatesWhenOptedIn() async throws {
+        let (app, recorder) = try await makeApp(
+            mode: .uuid,
+            publicPathPrefixes: ["/admin/"],
+            propagateTokenOnPublicRoutes: true
+        )
+        try await app.testing().test(
+            .GET, "admin/page",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "leak-me") }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+        await #expect(recorder.seen == "leak-me")
+        try await app.asyncShutdown()
+    }
+
+    @Test("protected route still propagates regardless of propagateTokenOnPublicRoutes")
+    func protectedRoutePropagatesAlways() async throws {
+        // When the route is enforced, the propagation flag is irrelevant: the
+        // token has been validated, so handlers must see it.
+        let uuid = "550e8400-e29b-41d4-a716-446655440000"
+        let (app, recorder) = try await makeApp(
+            mode: .uuid,
+            propagateTokenOnPublicRoutes: false  // explicit
+        )
+        try await app.testing().test(
+            .GET, "probe",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: uuid) }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+        await #expect(recorder.seen == uuid)
         try await app.asyncShutdown()
     }
 

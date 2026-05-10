@@ -1,0 +1,34 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux:
+    name: Swift ${{ matrix.swift }} on Linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        swift: ["6.0"]
+    container:
+      image: swift:${{ matrix.swift }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift build
+        run: swift build
+      - name: swift test
+        run: swift test --parallel
+
+  macos:
+    name: Swift on macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift build
+        run: swift build
+      - name: swift test
+        run: swift test --parallel

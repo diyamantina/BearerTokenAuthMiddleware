@@ -1,7 +1,7 @@
 # BearerTokenAuthMiddleware
 
 ![Swift 6.0+](https://img.shields.io/badge/Swift-6.0+-orange.svg)
-![Platforms](https://img.shields.io/badge/Platforms-macOS%20|%20iOS-blue.svg)
+![Platforms](https://img.shields.io/badge/Platforms-macOS%20%7C%20iOS%20%7C%20Linux-blue.svg)
 
 Two complementary middlewares for Swift services that speak OpenAPI:
 
@@ -96,7 +96,8 @@ public init(
     mode: AuthMode = .none,
     publicEndpoints: Set<String> = BearerTokenAuthServerMiddleware.defaultPublicEndpoints,
     publicPathPrefixes: Set<String> = [],
-    validation: ValidationStrategy = .auto
+    validation: ValidationStrategy = .auto,
+    propagateTokenOnPublicRoutes: Bool = false
 )
 ```
 
@@ -106,6 +107,7 @@ public init(
 | `publicEndpoints` | `["/health", "/healthz", "/ready", "/readyz", "/metrics"]` | Exact-path bypass list. Pass `[]` to require auth on every endpoint. |
 | `publicPathPrefixes` | `[]` | Boundary-anchored prefix matching. `["/admin"]` matches `/admin` and `/admin/x` but **not** `/administrator`. Trailing slash is normalised. |
 | `validation` | `.auto` | Resolves to `.uuidShape` for `.uuid`, `.jwtShape` for `.jwt`, `.none` for `.none`. Override with any explicit case. |
+| `propagateTokenOnPublicRoutes` | `false` | When the request bypasses enforcement (a public-endpoint or public-prefix match, or `.none` mode), keep `BearerTokenContext.token` `nil` so handlers and downstream loggers cannot accidentally see a token the operator declared they shouldn't. Set to `true` to surface the inbound token (pre-2.x behaviour). |
 
 ### Validation strategies
 
@@ -214,12 +216,12 @@ Server side (Vapor):
 
 ## Testing
 
-The package ships **58 tests across 13 suites**:
+The package ships **64 tests across 13 suites**:
 
 | Area | Tests |
 |---|---|
 | Client middleware | 8 |
-| Server core (modes, defaults, propagation) | 13 |
+| Server core (modes, defaults, propagation, public-route opt-in) | 19 |
 | Path-prefix boundary matching | 5 |
 | Path-prefix init normalization | 1 |
 | Non-Bearer Authorization schemes | 3 |
@@ -233,6 +235,8 @@ The package ships **58 tests across 13 suites**:
 | `BearerTokenContext` | 4 |
 
 Run them with `swift test`.
+
+CI runs the suite on macOS and on Linux (Swift 6.0 container).
 
 ## License
 

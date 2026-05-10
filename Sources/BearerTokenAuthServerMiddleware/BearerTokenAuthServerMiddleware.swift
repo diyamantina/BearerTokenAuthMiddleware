@@ -32,20 +32,19 @@ import Vapor
 ///   `["/admin/"]` both match `/admin` and `/admin/anything` but neither matches
 ///   `/administrator`.
 ///
-/// - Warning: On routes covered by `publicEndpoints` or `publicPathPrefixes`
-///   the middleware does not enforce token presence, but it **still**
-///   propagates whatever token the caller sent into ``BearerTokenContext/token``
-///   for downstream handlers. If a downstream logger captures request headers
-///   (e.g. `OpenAPILoggingMiddleware` with a permissive `BodyLoggingPolicy`),
-///   valid bearer tokens can land in log files via public-endpoint requests.
-///   Mitigations: use `BodyLoggingPolicy.never`, redact the `Authorization`
-///   header in a custom `LogHandler`, or skip logging inside public-endpoint
-///   handlers entirely.
+/// - Note: On routes covered by `publicEndpoints` or `publicPathPrefixes`,
+///   and in ``AuthMode/none``, the middleware does **not** propagate any
+///   inbound bearer token into ``BearerTokenContext/token`` by default; the
+///   downstream task-local stays `nil`. This avoids accidentally surfacing
+///   tokens to handlers/loggers on routes the operator declared as public.
+///   Set ``init(mode:publicEndpoints:publicPathPrefixes:validation:propagateTokenOnPublicRoutes:)``'s
+///   `propagateTokenOnPublicRoutes` parameter to `true` to opt back into the
+///   pre-2.x behaviour.
 ///
 /// ## Topics
 ///
 /// ### Configuring the middleware
-/// - ``init(mode:publicEndpoints:publicPathPrefixes:validation:)``
+/// - ``init(mode:publicEndpoints:publicPathPrefixes:validation:propagateTokenOnPublicRoutes:)``
 /// - ``defaultPublicEndpoints``
 ///
 /// ### Validation strategies
@@ -106,7 +105,7 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     /// Default set of paths exempted from auth enforcement.
     ///
     /// Health and readiness probes (Vapor + Kubernetes conventions) plus `/metrics`.
-    /// Pass an empty set to ``init(mode:publicEndpoints:publicPathPrefixes:validation:)``
+    /// Pass an empty set to ``init(mode:publicEndpoints:publicPathPrefixes:validation:propagateTokenOnPublicRoutes:)``
     /// to require auth on every endpoint.
     public static let defaultPublicEndpoints: Set<String> = [
         "/health",
@@ -120,6 +119,7 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     private let publicEndpoints: Set<String>
     private let normalizedPublicPathPrefixes: Set<String>
     private let validation: ValidationStrategy
+    private let propagateTokenOnPublicRoutes: Bool
 
     /// Creates a new middleware.
     ///
@@ -131,11 +131,19 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     ///     Boundary-anchored. Default empty.
     ///   - validation: ``ValidationStrategy`` to apply after presence check passes.
     ///     Default ``ValidationStrategy/auto``.
+    ///   - propagateTokenOnPublicRoutes: When `false` (default), the middleware
+    ///     keeps ``BearerTokenContext/token`` `nil` on requests that bypass
+    ///     enforcement (a `publicEndpoints` / `publicPathPrefixes` match, or
+    ///     ``AuthMode/none``). This is the secure default — handlers and
+    ///     downstream loggers cannot accidentally observe a token the operator
+    ///     declared they shouldn't see. Set to `true` to surface the inbound
+    ///     token to those handlers anyway (the pre-2.x behaviour).
     public init(
         mode: AuthMode = .none,
         publicEndpoints: Set<String> = BearerTokenAuthServerMiddleware.defaultPublicEndpoints,
         publicPathPrefixes: Set<String> = [],
-        validation: ValidationStrategy = .auto
+        validation: ValidationStrategy = .auto,
+        propagateTokenOnPublicRoutes: Bool = false
     ) {
         self.authMode = mode
         self.publicEndpoints = publicEndpoints
@@ -144,6 +152,7 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
                 .map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 }
                 .filter { !$0.isEmpty }
         )
+        self.propagateTokenOnPublicRoutes = propagateTokenOnPublicRoutes
         switch validation {
         case .auto:
             switch mode {
@@ -163,14 +172,16 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
         let token = request.headers.bearerAuthorization?.token
 
         if authMode == .none {
-            return try await BearerTokenContext.$token.withValue(token) {
+            let propagated = propagateTokenOnPublicRoutes ? token : nil
+            return try await BearerTokenContext.$token.withValue(propagated) {
                 try await next.respond(to: request)
             }
         }
 
         let path = request.url.path
         if publicEndpoints.contains(path) || matchesPublicPrefix(path: path) {
-            return try await BearerTokenContext.$token.withValue(token) {
+            let propagated = propagateTokenOnPublicRoutes ? token : nil
+            return try await BearerTokenContext.$token.withValue(propagated) {
                 try await next.respond(to: request)
             }
         }
