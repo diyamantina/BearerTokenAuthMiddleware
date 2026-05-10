@@ -40,8 +40,7 @@ struct CustomValidationTests {
     func validatorCalledOnProtected() async throws {
         let (app, recorder) = try await makeApp()
         try await app.testing().test(
-            .GET,
-            "probe",
+            .GET, "probe",
             beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "tok-1") }
         ) { res async in
             #expect(res.status == .ok)
@@ -56,8 +55,7 @@ struct CustomValidationTests {
             throw Abort(.forbidden, reason: "validator says no")
         }
         try await app.testing().test(
-            .GET,
-            "probe",
+            .GET, "probe",
             beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "anything") }
         ) { res async in
             #expect(res.status == .forbidden)
@@ -79,8 +77,7 @@ struct CustomValidationTests {
     func validatorNotCalledInNoneMode() async throws {
         let (app, recorder) = try await makeApp(mode: .none)
         try await app.testing().test(
-            .GET,
-            "probe",
+            .GET, "probe",
             beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "tok") }
         ) { res async in
             #expect(res.status == .ok)
@@ -93,8 +90,7 @@ struct CustomValidationTests {
     func validatorNotCalledForPublicEndpoint() async throws {
         let (app, recorder) = try await makeApp(publicEndpoints: ["/public"])
         try await app.testing().test(
-            .GET,
-            "public",
+            .GET, "public",
             beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "tok") }
         ) { res async in
             #expect(res.status == .ok)
@@ -110,7 +106,11 @@ struct JWTShapeValidationTests {
     private func makeApp() async throws -> Application {
         let app = try await Application.make(.testing)
         app.middleware.use(
-            BearerTokenAuthServerMiddleware(mode: .jwt, validation: .jwtShape)
+            BearerTokenAuthServerMiddleware(
+                mode: .jwt,
+                publicEndpoints: [],
+                validation: .jwtShape
+            )
         )
         app.get("probe") { _ in "ok" }
         return app
@@ -173,11 +173,14 @@ struct JWTShapeValidationTests {
 
 @Suite("ValidationStrategy.uuidShape")
 struct UUIDShapeValidationTests {
-
     private func makeApp() async throws -> Application {
         let app = try await Application.make(.testing)
         app.middleware.use(
-            BearerTokenAuthServerMiddleware(mode: .uuid, validation: .uuidShape)
+            BearerTokenAuthServerMiddleware(
+                mode: .uuid,
+                publicEndpoints: [],
+                validation: .uuidShape
+            )
         )
         app.get("probe") { _ in "ok" }
         return app
@@ -232,13 +235,9 @@ struct UUIDShapeValidationTests {
 @Suite("BearerTokenAuthServerError typed cases")
 struct TypedErrorTests {
 
-    /// Vapor translates AbortError to HTTP responses, but inside Swift we
-    /// can intercept the error before Vapor sees it by calling the
-    /// middleware directly with a hand-made Request.
-    private func runThroughMiddleware(
+    private func runMW(
         mode: AuthMode = .uuid,
-        validation: BearerTokenAuthServerMiddleware.ValidationStrategy = .none,
-        maxTokenLength: Int = 4096,
+        validation: BearerTokenAuthServerMiddleware.ValidationStrategy = .auto,
         authorization: String? = nil,
         path: String = "/probe"
     ) async throws -> Result<Response, Error> {
@@ -246,7 +245,7 @@ struct TypedErrorTests {
         defer { Task { try? await app.asyncShutdown() } }
         let mw = BearerTokenAuthServerMiddleware(
             mode: mode,
-            maxTokenLength: maxTokenLength,
+            publicEndpoints: [],
             validation: validation
         )
         let req = Request(
@@ -259,85 +258,70 @@ struct TypedErrorTests {
             req.headers.replaceOrAdd(name: .authorization, value: authorization)
         }
         struct OK: AsyncResponder {
-            func respond(to request: Request) async throws -> Response {
-                Response(status: .ok)
-            }
+            func respond(to request: Request) async throws -> Response { Response(status: .ok) }
         }
         do {
-            let res = try await mw.respond(to: req, chainingTo: OK())
-            return .success(res)
+            return .success(try await mw.respond(to: req, chainingTo: OK()))
         } catch {
             return .failure(error)
         }
     }
 
-    @Test(".missingToken is thrown when Authorization header is absent")
+    @Test(".missingToken when Authorization header absent")
     func missingTokenError() async throws {
-        let result = try await runThroughMiddleware()
+        let result = try await runMW()
         guard case .failure(let error) = result,
               let typed = error as? BearerTokenAuthServerError else {
-            Issue.record("expected BearerTokenAuthServerError, got \(result)")
-            return
+            Issue.record("expected BearerTokenAuthServerError, got \(result)"); return
         }
         #expect(typed == .missingToken)
         #expect(typed.status == .unauthorized)
         #expect(typed.reason == "Unauthorized")
     }
 
-    @Test(".emptyToken is thrown when bearer token portion is empty")
-    func emptyTokenError() async throws {
-        let result = try await runThroughMiddleware(authorization: "Bearer ")
-        guard case .failure(let error) = result else {
-            Issue.record("expected failure, got \(result)")
-            return
-        }
-        // Vapor's bearerAuthorization parser treats "Bearer " (no value)
-        // as no token at all -> .missingToken. Either typed case is a
-        // valid representation of "no usable token".
-        let typed = error as? BearerTokenAuthServerError
-        #expect(typed == .missingToken || typed == .emptyToken)
-    }
-
-    @Test(".oversizedToken is thrown when token exceeds maxTokenLength")
-    func oversizedTokenError() async throws {
-        let big = String(repeating: "x", count: 32)
-        let result = try await runThroughMiddleware(
-            maxTokenLength: 16,
-            authorization: "Bearer \(big)"
-        )
+    @Test(".missingToken when scheme is not Bearer")
+    func nonBearerSchemeError() async throws {
+        let result = try await runMW(authorization: "Basic dXNlcjpwYXNz")
         guard case .failure(let error) = result,
               let typed = error as? BearerTokenAuthServerError else {
-            Issue.record("expected BearerTokenAuthServerError, got \(result)")
-            return
+            Issue.record("expected BearerTokenAuthServerError, got \(result)"); return
         }
-        #expect(typed == .oversizedToken(maxLength: 16))
+        #expect(typed == .missingToken)
     }
 
-    @Test(".invalidJWTShape is thrown by jwtShape on malformed token")
+    @Test(".invalidToken when jwtShape rejects malformed token")
     func invalidJWTShapeError() async throws {
-        let result = try await runThroughMiddleware(
-            validation: .jwtShape,
-            authorization: "Bearer notjwt"
-        )
+        let result = try await runMW(validation: .jwtShape, authorization: "Bearer notjwt")
         guard case .failure(let error) = result,
               let typed = error as? BearerTokenAuthServerError else {
-            Issue.record("expected BearerTokenAuthServerError, got \(result)")
-            return
+            Issue.record("expected BearerTokenAuthServerError, got \(result)"); return
         }
-        #expect(typed == .invalidJWTShape)
+        #expect(typed == .invalidToken)
     }
 
-    @Test(".invalidUUIDShape is thrown by uuidShape on malformed token")
+    @Test(".invalidToken when uuidShape rejects malformed token")
     func invalidUUIDShapeError() async throws {
-        let result = try await runThroughMiddleware(
-            validation: .uuidShape,
-            authorization: "Bearer not-a-uuid"
-        )
+        let result = try await runMW(validation: .uuidShape, authorization: "Bearer not-a-uuid")
         guard case .failure(let error) = result,
               let typed = error as? BearerTokenAuthServerError else {
-            Issue.record("expected BearerTokenAuthServerError, got \(result)")
-            return
+            Issue.record("expected BearerTokenAuthServerError, got \(result)"); return
         }
-        #expect(typed == .invalidUUIDShape)
+        #expect(typed == .invalidToken)
+    }
+
+    @Test("validation: .none never throws .invalidToken — only .missingToken is possible")
+    func noneValidationOnlyMissingPossible() async throws {
+        // Token present, but the only check is presence — passes.
+        let success = try await runMW(validation: .none, authorization: "Bearer absolutely-anything")
+        guard case .success = success else {
+            Issue.record("expected success, got \(success)"); return
+        }
+        // Token absent — missingToken.
+        let failure = try await runMW(validation: .none)
+        guard case .failure(let error) = failure,
+              let typed = error as? BearerTokenAuthServerError else {
+            Issue.record("expected BearerTokenAuthServerError, got \(failure)"); return
+        }
+        #expect(typed == .missingToken)
     }
 }

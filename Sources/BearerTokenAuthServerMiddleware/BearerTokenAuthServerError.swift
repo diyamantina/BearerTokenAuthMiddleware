@@ -1,34 +1,27 @@
 import Vapor
 
-/// Typed errors thrown by ``BearerTokenAuthServerMiddleware``. All cases
-/// map to HTTP 401 with a generic "Unauthorized" reason (OWASP guidance:
-/// don't leak which sub-failure tripped) — but tests, instrumentation,
-/// and structured logging can still pattern-match on the typed case.
+/// Typed errors thrown by ``BearerTokenAuthServerMiddleware``. Two cases:
 ///
-/// Conforming to `AbortError` lets Vapor translate any thrown case into
-/// the correct HTTP response automatically.
+/// - ``missingToken`` — the request had no usable bearer token on a
+///   protected route. Covers: no `Authorization` header, `Authorization:
+///   Bearer ` with an empty value, and non-Bearer schemes (`Basic ...`,
+///   `Digest ...`, garbage).
+/// - ``invalidToken`` — a token was present but the configured
+///   ``BearerTokenAuthServerMiddleware/ValidationStrategy`` rejected it
+///   (wrong shape, signature mismatch from a `.custom` validator, etc.).
+///
+/// Both cases conform to `AbortError` so Vapor translates them to HTTP
+/// 401 with a generic "Unauthorized" reason (OWASP — same external
+/// message regardless of which sub-failure tripped). Tests and
+/// instrumentation pattern-match the typed case for richer signal.
 public enum BearerTokenAuthServerError: Error, AbortError, Equatable {
 
-    /// No `Authorization: Bearer ...` header on a protected route.
+    /// No usable bearer token on a protected request.
     case missingToken
 
-    /// `Authorization: Bearer` was present but the token portion was empty.
-    case emptyToken
-
-    /// Token exceeded the configured `maxTokenLength`.
-    case oversizedToken(maxLength: Int)
-
-    /// Selected ``ValidationStrategy/jwtShape`` and the token did not
-    /// match the JWT structural shape.
-    case invalidJWTShape
-
-    /// Selected ``ValidationStrategy/uuidShape`` and the token did not
-    /// match the canonical UUID string format.
-    case invalidUUIDShape
+    /// A bearer token was present but the validation strategy rejected it.
+    case invalidToken
 
     public var status: HTTPResponseStatus { .unauthorized }
-
-    /// All cases surface the same external reason. Internal differentiation
-    /// is for diagnostics, not for clients (per OWASP).
     public var reason: String { "Unauthorized" }
 }

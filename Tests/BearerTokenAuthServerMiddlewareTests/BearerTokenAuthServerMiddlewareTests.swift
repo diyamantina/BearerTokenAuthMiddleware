@@ -8,47 +8,51 @@ import VaporTesting
 @Suite("BearerTokenAuthServerMiddleware (server)")
 struct BearerTokenAuthServerMiddlewareTests {
 
-    /// Captures what `BearerTokenContext.token` was at handler-time, so tests
-    /// can verify the middleware propagated the token correctly.
     actor TokenRecorder {
         private(set) var seen: String?
         func record(_ value: String?) { seen = value }
     }
 
-    /// Spin up an in-process Vapor app with the middleware installed and a
-    /// single route at `GET /probe` that records `BearerTokenContext.token`.
+    /// Spin up a Vapor app with the middleware installed using the
+    /// supplied options (or pure defaults). Routes:
+    /// - GET /probe         → records BearerTokenContext.token
+    /// - GET /public        → records BearerTokenContext.token
+    /// - GET /admin/page    → records BearerTokenContext.token
+    /// - GET /health        → covered by default public endpoints
     @discardableResult
     private func makeApp(
         mode: AuthMode = .none,
-        publicEndpoints: Set<String> = [],
+        publicEndpoints: Set<String>? = nil,
         publicPathPrefixes: Set<String> = [],
-        maxTokenLength: Int = 4096
+        validation: BearerTokenAuthServerMiddleware.ValidationStrategy = .auto
     ) async throws -> (Application, TokenRecorder) {
         let app = try await Application.make(.testing)
         let recorder = TokenRecorder()
 
-        app.middleware.use(
-            BearerTokenAuthServerMiddleware(
+        let mw: BearerTokenAuthServerMiddleware
+        if let publicEndpoints {
+            mw = BearerTokenAuthServerMiddleware(
                 mode: mode,
                 publicEndpoints: publicEndpoints,
                 publicPathPrefixes: publicPathPrefixes,
-                maxTokenLength: maxTokenLength
+                validation: validation
             )
-        )
+        } else {
+            // Use the defaults
+            mw = BearerTokenAuthServerMiddleware(
+                mode: mode,
+                publicPathPrefixes: publicPathPrefixes,
+                validation: validation
+            )
+        }
+        app.middleware.use(mw)
 
-        app.get("probe") { _ -> String in
-            await recorder.record(BearerTokenContext.token)
-            return "ok"
+        for path in [["probe"], ["public"], ["admin", "page"], ["health"]] {
+            app.get(path.map(PathComponent.init(stringLiteral:))) { _ -> String in
+                await recorder.record(BearerTokenContext.token)
+                return "ok"
+            }
         }
-        app.get("public") { _ -> String in
-            await recorder.record(BearerTokenContext.token)
-            return "ok"
-        }
-        app.get("admin", "page") { _ -> String in
-            await recorder.record(BearerTokenContext.token)
-            return "ok"
-        }
-
         return (app, recorder)
     }
 
@@ -64,12 +68,11 @@ struct BearerTokenAuthServerMiddlewareTests {
         try await app.asyncShutdown()
     }
 
-    @Test(".none mode passes through but propagates token if present")
+    @Test(".none mode propagates the token if one is present")
     func nonePropagatesPresentToken() async throws {
         let (app, recorder) = try await makeApp(mode: .none)
         try await app.testing().test(
-            .GET,
-            "probe",
+            .GET, "probe",
             beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "tok-1") }
         ) { res async in
             #expect(res.status == .ok)
@@ -78,9 +81,9 @@ struct BearerTokenAuthServerMiddlewareTests {
         try await app.asyncShutdown()
     }
 
-    // MARK: - .uuid mode (representative of any non-.none mode)
+    // MARK: - .uuid mode rejects missing token (default validation = .uuidShape now)
 
-    @Test(".uuid mode rejects a request with no Authorization header")
+    @Test(".uuid mode rejects request with no Authorization header")
     func uuidRejectsMissingToken() async throws {
         let (app, _) = try await makeApp(mode: .uuid)
         try await app.testing().test(.GET, "probe") { res async in
@@ -89,97 +92,105 @@ struct BearerTokenAuthServerMiddlewareTests {
         try await app.asyncShutdown()
     }
 
-    @Test(".uuid mode accepts a request with a valid token, propagates to handler")
-    func uuidAcceptsValidToken() async throws {
+    @Test(".uuid mode with default validation accepts a canonical UUID, propagates")
+    func uuidAcceptsCanonicalUUID() async throws {
         let (app, recorder) = try await makeApp(mode: .uuid)
+        let uuid = "550e8400-e29b-41d4-a716-446655440000"
         try await app.testing().test(
-            .GET,
-            "probe",
-            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "good") }
+            .GET, "probe",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: uuid) }
         ) { res async in
             #expect(res.status == .ok)
         }
-        await #expect(recorder.seen == "good")
+        await #expect(recorder.seen == uuid)
         try await app.asyncShutdown()
     }
 
-    @Test(".uuid mode rejects an empty bearer token")
-    func uuidRejectsEmptyToken() async throws {
+    @Test(".uuid mode with default validation REJECTS a non-UUID token")
+    func uuidRejectsNonUUID() async throws {
         let (app, _) = try await makeApp(mode: .uuid)
         try await app.testing().test(
-            .GET,
-            "probe",
-            beforeRequest: { req in req.headers.replaceOrAdd(name: .authorization, value: "Bearer ") }
+            .GET, "probe",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "not-a-uuid") }
         ) { res async in
             #expect(res.status == .unauthorized)
         }
         try await app.asyncShutdown()
     }
 
-    @Test(".uuid mode rejects a token longer than maxTokenLength")
-    func uuidRejectsOversizedToken() async throws {
-        let (app, _) = try await makeApp(mode: .uuid, maxTokenLength: 16)
-        let oversized = String(repeating: "x", count: 32)
+    @Test(".uuid mode with explicit validation: .none accepts ANY non-empty token")
+    func uuidWithExplicitNoneValidationAcceptsAnything() async throws {
+        let (app, _) = try await makeApp(mode: .uuid, validation: .none)
         try await app.testing().test(
-            .GET,
-            "probe",
-            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: oversized) }
+            .GET, "probe",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "any-string") }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+        try await app.asyncShutdown()
+    }
+
+    // MARK: - .jwt mode (default validation = .jwtShape)
+
+    @Test(".jwt mode rejects missing, accepts valid-shape JWT, rejects malformed")
+    func jwtModeDefaults() async throws {
+        let (app, recorder) = try await makeApp(mode: .jwt)
+        // missing
+        try await app.testing().test(.GET, "probe") { res async in
+            #expect(res.status == .unauthorized)
+        }
+        // good shape
+        let goodJWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.abc-_DEF"
+        try await app.testing().test(
+            .GET, "probe",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: goodJWT) }
+        ) { res async in
+            #expect(res.status == .ok)
+        }
+        await #expect(recorder.seen == goodJWT)
+        // malformed
+        try await app.testing().test(
+            .GET, "probe",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "not-jwt") }
         ) { res async in
             #expect(res.status == .unauthorized)
         }
         try await app.asyncShutdown()
     }
 
-    @Test(".uuid mode allows token exactly at maxTokenLength")
-    func uuidAllowsBoundaryToken() async throws {
-        let (app, recorder) = try await makeApp(mode: .uuid, maxTokenLength: 16)
-        let exact = String(repeating: "y", count: 16)
-        try await app.testing().test(
-            .GET,
-            "probe",
-            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: exact) }
-        ) { res async in
+    // MARK: - default public endpoints (health/ready/metrics)
+
+    @Test(".uuid mode lets default public endpoints (/health) through without a token")
+    func defaultHealthEndpointBypass() async throws {
+        let (app, _) = try await makeApp(mode: .uuid)
+        try await app.testing().test(.GET, "health") { res async in
             #expect(res.status == .ok)
         }
-        await #expect(recorder.seen == exact)
         try await app.asyncShutdown()
     }
 
-    // MARK: - public endpoint exact match
+    @Test("constructor literal default exposes /health, /healthz, /ready, /readyz, /metrics")
+    func defaultPublicEndpointsContents() {
+        let defaults = BearerTokenAuthServerMiddleware.defaultPublicEndpoints
+        #expect(defaults.contains("/health"))
+        #expect(defaults.contains("/healthz"))
+        #expect(defaults.contains("/ready"))
+        #expect(defaults.contains("/readyz"))
+        #expect(defaults.contains("/metrics"))
+    }
 
-    @Test(".uuid mode lets exact-match public endpoints through without a token")
-    func uuidPublicEndpointBypass() async throws {
-        let (app, recorder) = try await makeApp(
-            mode: .uuid,
-            publicEndpoints: ["/public"]
-        )
-        try await app.testing().test(.GET, "public") { res async in
-            #expect(res.status == .ok)
+    @Test("explicit empty publicEndpoints overrides the default — health is now protected")
+    func emptyPublicEndpointsOverridesDefault() async throws {
+        let (app, _) = try await makeApp(mode: .uuid, publicEndpoints: [])
+        try await app.testing().test(.GET, "health") { res async in
+            #expect(res.status == .unauthorized)
         }
-        await #expect(recorder.seen == nil)
         try await app.asyncShutdown()
     }
 
-    @Test(".uuid mode public endpoint still propagates token when one is sent")
-    func uuidPublicEndpointPropagatesPresentToken() async throws {
-        let (app, recorder) = try await makeApp(
-            mode: .uuid,
-            publicEndpoints: ["/public"]
-        )
-        try await app.testing().test(
-            .GET,
-            "public",
-            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "anon") }
-        ) { res async in
-            #expect(res.status == .ok)
-        }
-        await #expect(recorder.seen == "anon")
-        try await app.asyncShutdown()
-    }
+    // MARK: - public path prefix (still works alongside default endpoints)
 
-    // MARK: - public path prefix
-
-    @Test(".uuid mode lets paths under publicPathPrefixes through without a token")
+    @Test(".uuid mode lets paths under publicPathPrefixes through")
     func uuidPublicPathPrefixBypass() async throws {
         let (app, _) = try await makeApp(
             mode: .uuid,
@@ -193,7 +204,6 @@ struct BearerTokenAuthServerMiddlewareTests {
 
     @Test(".uuid mode does NOT bypass paths just because a prefix substring matches mid-path")
     func uuidPathPrefixIsLeftAnchored() async throws {
-        // `publicPathPrefixes: ["/admin/"]` should NOT bypass `/probe`.
         let (app, _) = try await makeApp(
             mode: .uuid,
             publicPathPrefixes: ["/admin/"]
@@ -201,25 +211,6 @@ struct BearerTokenAuthServerMiddlewareTests {
         try await app.testing().test(.GET, "probe") { res async in
             #expect(res.status == .unauthorized)
         }
-        try await app.asyncShutdown()
-    }
-
-    // MARK: - .jwt mode behaves identically to .uuid for enforcement
-
-    @Test(".jwt mode rejects missing token, accepts present token")
-    func jwtRejectsAndAccepts() async throws {
-        let (app, recorder) = try await makeApp(mode: .jwt)
-        try await app.testing().test(.GET, "probe") { res async in
-            #expect(res.status == .unauthorized)
-        }
-        try await app.testing().test(
-            .GET,
-            "probe",
-            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "jwt-here") }
-        ) { res async in
-            #expect(res.status == .ok)
-        }
-        await #expect(recorder.seen == "jwt-here")
         try await app.asyncShutdown()
     }
 
@@ -237,19 +228,18 @@ struct BearerTokenAuthServerMiddlewareTests {
     }
 }
 
-// MARK: - Path-prefix boundary safety (hardened matcher)
+// MARK: - Path-prefix boundary safety
 
 @Suite("Path-prefix boundary matching")
 struct PathPrefixBoundaryTests {
-
-    /// Same harness as the main suite, but factored out so the boundary
-    /// tests can run in isolation.
     private func makeApp(prefixes: Set<String>) async throws -> Application {
         let app = try await Application.make(.testing)
         app.middleware.use(
             BearerTokenAuthServerMiddleware(
                 mode: .uuid,
-                publicPathPrefixes: prefixes
+                publicEndpoints: [],
+                publicPathPrefixes: prefixes,
+                validation: .none
             )
         )
         app.get("admin") { _ in "ok" }
@@ -268,7 +258,7 @@ struct PathPrefixBoundaryTests {
         try await app.asyncShutdown()
     }
 
-    @Test("prefix `/admin` matches `/admin/page` (path component boundary)")
+    @Test("prefix `/admin` matches `/admin/page` (component boundary)")
     func componentBoundaryMatch() async throws {
         let app = try await makeApp(prefixes: ["/admin"])
         try await app.testing().test(.GET, "admin/page") { res async in
@@ -286,7 +276,7 @@ struct PathPrefixBoundaryTests {
         try await app.asyncShutdown()
     }
 
-    @Test("prefix `/admin` does NOT match `/admins/list` (similar path, different component)")
+    @Test("prefix `/admin` does NOT match `/admins/list`")
     func doesNotMatchPluralNamespace() async throws {
         let app = try await makeApp(prefixes: ["/admin"])
         try await app.testing().test(.GET, "admins/list") { res async in
@@ -295,7 +285,7 @@ struct PathPrefixBoundaryTests {
         try await app.asyncShutdown()
     }
 
-    @Test("prefix `/admin/` (trailing slash) behaves identically to `/admin`")
+    @Test("prefix `/admin/` (trailing slash) is equivalent to `/admin`")
     func trailingSlashEquivalent() async throws {
         let app = try await makeApp(prefixes: ["/admin/"])
         try await app.testing().test(.GET, "admin") { res async in
@@ -311,24 +301,28 @@ struct PathPrefixBoundaryTests {
     }
 }
 
-// MARK: - Non-Bearer Authorization schemes treated as missing
+// MARK: - Non-Bearer Authorization schemes
 
 @Suite("Non-Bearer Authorization schemes")
 struct NonBearerAuthorizationTests {
-
     private func makeApp() async throws -> Application {
         let app = try await Application.make(.testing)
-        app.middleware.use(BearerTokenAuthServerMiddleware(mode: .uuid))
+        app.middleware.use(
+            BearerTokenAuthServerMiddleware(
+                mode: .uuid,
+                publicEndpoints: [],
+                validation: .none
+            )
+        )
         app.get("probe") { _ in "ok" }
         return app
     }
 
-    @Test("`Authorization: Basic abc` is treated as missing (rejected on protected route)")
+    @Test("`Authorization: Basic abc` is treated as missing")
     func basicAuthRejected() async throws {
         let app = try await makeApp()
         try await app.testing().test(
-            .GET,
-            "probe",
+            .GET, "probe",
             beforeRequest: { req in
                 req.headers.replaceOrAdd(name: .authorization, value: "Basic dXNlcjpwYXNz")
             }
@@ -342,8 +336,7 @@ struct NonBearerAuthorizationTests {
     func digestAuthRejected() async throws {
         let app = try await makeApp()
         try await app.testing().test(
-            .GET,
-            "probe",
+            .GET, "probe",
             beforeRequest: { req in
                 req.headers.replaceOrAdd(name: .authorization, value: "Digest username=\"x\"")
             }
@@ -357,8 +350,7 @@ struct NonBearerAuthorizationTests {
     func garbageAuthRejected() async throws {
         let app = try await makeApp()
         try await app.testing().test(
-            .GET,
-            "probe",
+            .GET, "probe",
             beforeRequest: { req in
                 req.headers.replaceOrAdd(name: .authorization, value: "totally-not-a-scheme")
             }
@@ -369,7 +361,7 @@ struct NonBearerAuthorizationTests {
     }
 }
 
-// MARK: - Methods other than GET
+// MARK: - HTTP methods
 
 @Suite("HTTP methods")
 struct HTTPMethodTests {
@@ -379,10 +371,16 @@ struct HTTPMethodTests {
         func record(_ value: String?) { seen = value }
     }
 
-    private func makeApp(mode: AuthMode = .uuid) async throws -> (Application, TokenRecorder) {
+    private func makeApp() async throws -> (Application, TokenRecorder) {
         let app = try await Application.make(.testing)
         let recorder = TokenRecorder()
-        app.middleware.use(BearerTokenAuthServerMiddleware(mode: mode))
+        app.middleware.use(
+            BearerTokenAuthServerMiddleware(
+                mode: .uuid,
+                publicEndpoints: [],
+                validation: .none
+            )
+        )
         for method in [HTTPMethod.GET, .POST, .PUT, .PATCH, .DELETE] {
             app.on(method, "thing") { _ -> String in
                 await recorder.record(BearerTokenContext.token)
@@ -392,11 +390,11 @@ struct HTTPMethodTests {
         return (app, recorder)
     }
 
-    @Test("POST is rejected without token, accepted with token", arguments: [
-        ("POST",  HTTPMethod.POST),
-        ("PUT",   HTTPMethod.PUT),
-        ("PATCH", HTTPMethod.PATCH),
-        ("DELETE",HTTPMethod.DELETE),
+    @Test("non-GET methods enforce too", arguments: [
+        ("POST",   HTTPMethod.POST),
+        ("PUT",    HTTPMethod.PUT),
+        ("PATCH",  HTTPMethod.PATCH),
+        ("DELETE", HTTPMethod.DELETE),
     ])
     func nonGETMethodsEnforce(_ name: String, _ method: HTTPMethod) async throws {
         let (app, recorder) = try await makeApp()
@@ -404,8 +402,7 @@ struct HTTPMethodTests {
             #expect(res.status == .unauthorized)
         }
         try await app.testing().test(
-            method,
-            "thing",
+            method, "thing",
             beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "t-\(name)") }
         ) { res async in
             #expect(res.status == .ok)
@@ -417,18 +414,70 @@ struct HTTPMethodTests {
 
 @Suite("Path-prefix init normalization")
 struct PathPrefixNormalizationTests {
-
     @Test("empty prefix is filtered out (does not match every path)")
     func emptyPrefixFiltered() async throws {
         let app = try await Application.make(.testing)
         app.middleware.use(
             BearerTokenAuthServerMiddleware(
                 mode: .uuid,
-                publicPathPrefixes: ["", "/", "/public"]
+                publicEndpoints: [],
+                publicPathPrefixes: ["", "/", "/public"],
+                validation: .none
             )
         )
         app.get("anything") { _ in "ok" }
         try await app.testing().test(.GET, "anything") { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.asyncShutdown()
+    }
+}
+
+// MARK: - Auto-picked validation strategy
+
+@Suite("Auto-picked ValidationStrategy")
+struct AutoValidationTests {
+    @Test(".none mode → no validation (any non-empty token accepted on protected route)")
+    func noneAutoValidation() async throws {
+        let app = try await Application.make(.testing)
+        app.middleware.use(
+            BearerTokenAuthServerMiddleware(mode: .none)
+        )
+        app.get("probe") { _ in "ok" }
+        // .none mode never enforces, so even probe is open
+        try await app.testing().test(.GET, "probe") { res async in
+            #expect(res.status == .ok)
+        }
+        try await app.asyncShutdown()
+    }
+
+    @Test(".uuid mode → validation auto-picks .uuidShape (rejects non-UUID)")
+    func uuidAutoValidation() async throws {
+        let app = try await Application.make(.testing)
+        app.middleware.use(
+            BearerTokenAuthServerMiddleware(mode: .uuid, publicEndpoints: [])
+        )
+        app.get("probe") { _ in "ok" }
+        try await app.testing().test(
+            .GET, "probe",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "not-uuid") }
+        ) { res async in
+            #expect(res.status == .unauthorized)
+        }
+        try await app.asyncShutdown()
+    }
+
+    @Test(".jwt mode → validation auto-picks .jwtShape (rejects non-JWT)")
+    func jwtAutoValidation() async throws {
+        let app = try await Application.make(.testing)
+        app.middleware.use(
+            BearerTokenAuthServerMiddleware(mode: .jwt, publicEndpoints: [])
+        )
+        app.get("probe") { _ in "ok" }
+        try await app.testing().test(
+            .GET, "probe",
+            beforeRequest: { req in req.headers.bearerAuthorization = .init(token: "not-jwt") }
+        ) { res async in
             #expect(res.status == .unauthorized)
         }
         try await app.asyncShutdown()

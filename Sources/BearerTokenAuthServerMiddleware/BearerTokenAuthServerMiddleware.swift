@@ -6,30 +6,52 @@ import Vapor
 /// strategy against the token, and propagates the token via
 /// ``BearerTokenContext/token`` for downstream handlers.
 ///
-/// The middleware does not verify a token's authenticity — DB session
-/// lookup, JWT signature verification, expiry checking, etc. require
-/// per-project context (the database, the signing key) and stay in the
-/// consumer's handlers. Use ``ValidationStrategy/custom(_:)`` to plug
-/// project-specific verification in here, or one of the bundled
-/// shape-only strategies.
+/// ## Quick start
 ///
-/// Mode behavior:
+/// Single-line construction picks sensible defaults:
 ///
-/// - ``AuthMode/none`` — pass through without enforcement. Token is still
-///   propagated via `BearerTokenContext.token` if the caller sent one,
-///   so handlers may opt into reading it. **Validation strategy is not
-///   applied in this mode.**
-/// - ``AuthMode/uuid`` / ``AuthMode/jwt`` — require a bearer token on
-///   every request whose path is not in `publicEndpoints` and is not
-///   under any prefix in `publicPathPrefixes`. Missing or oversized
-///   tokens throw ``BearerTokenAuthServerError`` (which conforms to
-///   `AbortError`, so Vapor translates them to HTTP 401). On a
-///   present-and-bounded token, the configured ``ValidationStrategy``
-///   runs; if it throws, the error propagates unchanged.
+///     app.middleware.use(BearerTokenAuthServerMiddleware(mode: .jwt))
 ///
-/// Path-prefix matching is boundary-anchored: `["/admin"]` and
-/// `["/admin/"]` both match `/admin` and `/admin/anything` but neither
-/// matches `/administrator`.
+/// That installs JWT shape validation, exempts the common health/ready
+/// endpoints, and rejects any protected-route request without a Bearer
+/// header. No further setup required to get a working baseline.
+///
+/// ## Error model
+///
+/// - ``AuthMode/none``: never throws. Token (if any) is propagated to
+///   ``BearerTokenContext/token`` and the request continues.
+/// - ``AuthMode/uuid`` or ``AuthMode/jwt`` on a public route
+///   (``publicEndpoints`` exact match, or under ``publicPathPrefixes``):
+///   never throws. Same passthrough as ``AuthMode/none``.
+/// - ``AuthMode/uuid`` or ``AuthMode/jwt`` on a protected route:
+///   - **No usable token** → throws
+///     ``BearerTokenAuthServerError/missingToken``. Covers absent
+///     `Authorization` header, `Authorization: Bearer ` with empty
+///     value, and non-Bearer schemes (`Basic`, `Digest`, garbage).
+///   - **Token present, validation strategy rejects it** → throws
+///     ``BearerTokenAuthServerError/invalidToken``. (User-supplied
+///     ``ValidationStrategy/custom(_:)`` validators may instead throw
+///     any `Error`; it propagates unchanged.)
+///   - **Token accepted** → handler runs with the token in
+///     ``BearerTokenContext/token``.
+///
+/// ## What the middleware does NOT do
+///
+/// - **JWT signature verification** — needs the signing key. Use
+///   ``ValidationStrategy/custom(_:)`` with JWTKit or similar.
+/// - **JWT `exp` / `nbf` / `iat` claim verification** — must happen
+///   together with signature verification (otherwise the claims are
+///   trivially forgeable). Same place: a `.custom` validator.
+/// - **UUID session liveness / expiry** — needs DB access. Same place.
+///
+/// The bundled ``ValidationStrategy/jwtShape`` is **shape-only** and does
+/// not provide any security guarantees beyond "this looks like a JWT."
+/// Same for ``ValidationStrategy/uuidShape``.
+///
+/// ## Path-prefix matching
+///
+/// Boundary-anchored: `["/admin"]` and `["/admin/"]` both match `/admin`
+/// and `/admin/anything` but neither matches `/administrator`.
 public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
 
     /// User-supplied closure type for ``ValidationStrategy/custom(_:)``.
@@ -37,48 +59,52 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     /// Throwing rejects the request; returning normally allows it.
     public typealias Validator = @Sendable (String) async throws -> Void
 
-    /// What to do with a bearer token after presence + length checks pass.
+    /// What to do with a bearer token after presence checks pass.
     public enum ValidationStrategy: Sendable {
-        /// Don't validate. Middleware only enforces presence + length.
-        /// Handlers do whatever validation they need.
+        /// Auto-pick based on `AuthMode`: `.uuid` → `.uuidShape`,
+        /// `.jwt` → `.jwtShape`, `.none` → `.none`.
+        case auto
+
+        /// Skip validation entirely. The only thrown case becomes
+        /// ``BearerTokenAuthServerError/missingToken``.
         case none
-
-        /// Bundled structural check: token must look like a JWT (three
-        /// non-empty Base64URL segments separated by `.`). Does NOT
-        /// verify the signature; that needs the signing key.
         case jwtShape
-
-        /// Bundled structural check: token must be a canonical
-        /// 8-4-4-4-12 UUID string (case-insensitive).
         case uuidShape
-
-        /// User-supplied validator. Implement DB session lookup,
-        /// JWT signature verification, expiry, etc. here.
         case custom(Validator)
     }
+
+    /// Default set of paths exempted from auth enforcement. Health and
+    /// readiness probes (Vapor + Kubernetes conventions) plus `/metrics`.
+    /// Override by passing your own set; pass an empty set to require
+    /// auth on every endpoint.
+    public static let defaultPublicEndpoints: Set<String> = [
+        "/health",
+        "/healthz",
+        "/ready",
+        "/readyz",
+        "/metrics"
+    ]
 
     private let authMode: AuthMode
     private let publicEndpoints: Set<String>
     private let normalizedPublicPathPrefixes: Set<String>
-    private let maxTokenLength: Int
     private let validation: ValidationStrategy
 
     /// - Parameters:
-    ///   - mode: Active authentication mode. Defaults to ``AuthMode/none``
-    ///     so the middleware is harmless if installed but unconfigured.
-    ///   - publicEndpoints: Exact paths that bypass enforcement. Default empty.
+    ///   - mode: Active authentication mode. Default ``AuthMode/none``.
+    ///   - publicEndpoints: Exact paths that bypass enforcement. Defaults
+    ///     to ``defaultPublicEndpoints`` (health/ready/metrics).
     ///   - publicPathPrefixes: Path prefixes whose subtree bypasses
     ///     enforcement. Boundary-anchored. Default empty.
-    ///   - maxTokenLength: Reject tokens longer than this. Default `4096`.
-    ///   - validation: ``ValidationStrategy`` to apply after presence +
-    ///     length checks pass. Default ``ValidationStrategy/none`` —
-    ///     no extra check beyond presence.
+    ///   - validation: ``ValidationStrategy`` to apply after presence
+    ///     check passes. Default ``ValidationStrategy/auto`` — picks
+    ///     based on `mode`. Pass ``ValidationStrategy/none`` to opt out
+    ///     of validation entirely even on a non-`.none` mode.
     public init(
         mode: AuthMode = .none,
-        publicEndpoints: Set<String> = [],
+        publicEndpoints: Set<String> = BearerTokenAuthServerMiddleware.defaultPublicEndpoints,
         publicPathPrefixes: Set<String> = [],
-        maxTokenLength: Int = 4096,
-        validation: ValidationStrategy = .none
+        validation: ValidationStrategy = .auto
     ) {
         self.authMode = mode
         self.publicEndpoints = publicEndpoints
@@ -87,8 +113,16 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
                 .map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 }
                 .filter { !$0.isEmpty }
         )
-        self.maxTokenLength = maxTokenLength
-        self.validation = validation
+        switch validation {
+        case .auto:
+            switch mode {
+            case .none: self.validation = .none
+            case .uuid: self.validation = .uuidShape
+            case .jwt:  self.validation = .jwtShape
+            }
+        default:
+            self.validation = validation
+        }
     }
 
     public func respond(
@@ -97,14 +131,12 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     ) async throws -> Response {
         let token = request.headers.bearerAuthorization?.token
 
-        // .none: passthrough. Validation is not applied.
         if authMode == .none {
             return try await BearerTokenContext.$token.withValue(token) {
                 try await next.respond(to: request)
             }
         }
 
-        // Public route: passthrough. Validation is not applied.
         let path = request.url.path
         if publicEndpoints.contains(path) || matchesPublicPrefix(path: path) {
             return try await BearerTokenContext.$token.withValue(token) {
@@ -112,15 +144,8 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
             }
         }
 
-        // Protected route: enforce presence + length, then validate.
-        guard let token else {
+        guard let token, !token.isEmpty else {
             throw BearerTokenAuthServerError.missingToken
-        }
-        guard !token.isEmpty else {
-            throw BearerTokenAuthServerError.emptyToken
-        }
-        guard token.count <= maxTokenLength else {
-            throw BearerTokenAuthServerError.oversizedToken(maxLength: maxTokenLength)
         }
 
         try await applyValidation(to: token)
@@ -132,14 +157,10 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
 
     private func applyValidation(to token: String) async throws {
         switch validation {
-        case .none:
-            return
-        case .jwtShape:
-            try Self.validateJWTShape(token)
-        case .uuidShape:
-            try Self.validateUUIDShape(token)
-        case .custom(let validator):
-            try await validator(token)
+        case .auto, .none:           return  // .auto already resolved in init
+        case .jwtShape:              try Self.validateJWTShape(token)
+        case .uuidShape:             try Self.validateUUIDShape(token)
+        case .custom(let validator): try await validator(token)
         }
     }
 
@@ -150,18 +171,18 @@ public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
     private static func validateJWTShape(_ token: String) throws {
         let segments = token.split(separator: ".", omittingEmptySubsequences: false)
         guard segments.count == 3 else {
-            throw BearerTokenAuthServerError.invalidJWTShape
+            throw BearerTokenAuthServerError.invalidToken
         }
         for segment in segments {
             guard !segment.isEmpty, segment.allSatisfy({ jwtSegmentChars.contains($0) }) else {
-                throw BearerTokenAuthServerError.invalidJWTShape
+                throw BearerTokenAuthServerError.invalidToken
             }
         }
     }
 
     private static func validateUUIDShape(_ token: String) throws {
         guard UUID(uuidString: token) != nil else {
-            throw BearerTokenAuthServerError.invalidUUIDShape
+            throw BearerTokenAuthServerError.invalidToken
         }
     }
 
