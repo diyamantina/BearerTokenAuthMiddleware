@@ -1,212 +1,239 @@
-# BearerTokenAuthenticationMiddleware
+# BearerTokenAuthMiddleware
 
 ![Swift 6.0+](https://img.shields.io/badge/Swift-6.0+-orange.svg)
 ![Platforms](https://img.shields.io/badge/Platforms-macOS%20|%20iOS-blue.svg)
 
-A lightweight, concurrency-safe Swift middleware that injects a **Bearer token** into outgoing OpenAPI client requests.
+Two complementary middlewares for Swift services that speak OpenAPI:
 
-Built for `OpenAPIRuntime`, this package provides a composable, dependency-free way to handle token-based authentication in OpenAPI-generated Swift clients.
+- **`BearerTokenAuthMiddleware`** — client-side. Stamps `Authorization: Bearer <token>` on outbound OpenAPI requests, with per-operation skip filtering. Pure `OpenAPIRuntime`, safe on iOS.
+- **`BearerTokenAuthServerMiddleware`** — server-side. Vapor `AsyncMiddleware` that conditionally enforces token presence, optionally runs structural validation (JWT shape / UUID shape / custom closure), and propagates the token via a `TaskLocal` so OpenAPI-generated handlers (which never see Vapor's `Request`) can read it.
 
----
+Both products live in the same package; pick the one(s) you need per target.
 
-## 🧩 Overview
-
-`BearerTokenAuthenticationMiddleware` automatically adds an `Authorization` header to each outgoing request, using the standard `Bearer <token>` format.
-
-It’s thread-safe, actor-isolated, and works seamlessly with other OpenAPI middlewares such as:
-
-- [`OpenAPILoggingMiddleware`](https://github.com/mihaelamj/OpenAPILoggingMiddleware)
-- `APICorrectionMiddleware`
-- or any custom middlewares in your stack.
-
-You can dynamically update the token at runtime, and even decide **which operations** should skip authentication (for example, public endpoints).
-
----
-
-## 🚀 Installation
-
-Add the package to your **`Package.swift`**:
+## Installation
 
 ```swift
-.package(url: "https://github.com/mihaelamj/BearerTokenAuthMiddleware.git", from: "1.0.0")
+.package(url: "https://github.com/mihaelamj/BearerTokenAuthMiddleware", from: "2.0.0"),
 ```
 
-and include it in your target dependencies:
-
 ```swift
+// iOS / macOS app target — only needs the client product
 .target(
     name: "MyApp",
     dependencies: [
-        .product(name: "BearerTokenAuthMiddleware", package: "BearerTokenAuthMiddleware")
+        .product(name: "BearerTokenAuthMiddleware", package: "BearerTokenAuthMiddleware"),
     ]
-)
+),
+
+// Vapor server target — needs the server product
+.target(
+    name: "MyApi",
+    dependencies: [
+        .product(name: "BearerTokenAuthServerMiddleware", package: "BearerTokenAuthMiddleware"),
+        .product(name: "Vapor", package: "vapor"),
+    ]
+),
 ```
 
-Then import it:
+## Quick start
+
+### Client (iOS / macOS / server-to-server)
 
 ```swift
 import BearerTokenAuthMiddleware
-```
+import OpenAPIAsyncHTTPClient
 
----
-
-## ⚙️ Usage
-
-### Basic setup
-
-```swift
-import OpenAPIRuntime
-import BearerTokenAuthMiddleware
-
-let authMiddleware = BearerTokenAuthenticationMiddleware(
-    initialToken: "my-secret-token"
+let auth = BearerTokenAuthenticationMiddleware(
+    initialToken: nil,
+    skipAuthorization: { opID in
+        ["login", "refreshToken", "getHealth"].contains(opID)
+    }
 )
 
 let client = Client(
-    serverURL: URL(string: "https://api.example.com")!,
+    serverURL: serverURL,
     transport: AsyncHTTPClientTransport(),
-    middlewares: [authMiddleware]
+    middlewares: [auth]
 )
+
+// Later, after a successful login:
+auth.updateToken(loginResponse.accessToken)
 ```
 
-Each request sent through this client will automatically include:
-
-```
-Authorization: Bearer my-secret-token
-```
-
----
-
-### Conditional Authorization
-
-You can specify which endpoints should **skip** authentication by providing a `skipAuthorization` closure:
+### Server (Vapor)
 
 ```swift
-let authMiddleware = BearerTokenAuthenticationMiddleware(
-    initialToken: "public-or-private",
-    skipAuthorization: { operationID in
-        // Return true to skip adding the Authorization header
-        ["login", "register", "healthcheck"].contains(operationID)
-    }
-)
+import BearerTokenAuthServerMiddleware
+import Vapor
+
+// One-liner: JWT shape validation + health-endpoint exemption + bearer enforcement
+app.middleware.use(BearerTokenAuthServerMiddleware(mode: .jwt))
 ```
 
----
+That's a fully-configured middleware. The `validation: .auto` default resolves to `.jwtShape`, the default `publicEndpoints` exempt `/health`, `/healthz`, `/ready`, `/readyz`, `/metrics`, and any other route that lacks a Bearer header gets a 401.
 
-### Updating the token at runtime
-
-Because the middleware manages token state through a dedicated actor, you can safely update the token from any async context:
+OpenAPI-generated handlers can read the extracted token:
 
 ```swift
-authMiddleware.updateToken("new-access-token")
-```
+import BearerTokenAuthServerMiddleware
 
-The next outgoing request will use the updated token automatically.
-
----
-
-## 🧠 How It Works
-
-The middleware wraps outgoing `HTTPRequest` objects and, unless excluded by your `skipAuthorization` rule, injects a header in the following format:
-
-```
-Authorization: Bearer <token>
-```
-
-The token itself is stored inside an internal `TokenStorage` actor:
-
-```swift
-private actor TokenStorage {
-    var token: String?
-    
-    func getToken() -> String? { token }
-    func setToken(_ newToken: String?) { token = newToken }
-}
-```
-
-This ensures the token is **never accessed concurrently** or mutated outside an isolated context — an important detail when using Swift Concurrency in multi-request environments.
-
----
-
-## 🔒 Example Integration with `ApiClient`
-
-This package fits naturally into a middleware chain.
-For example, here’s how it integrates in a real-world client alongside `OpenAPILoggingMiddleware` and other middlewares:
-
-```swift
-import Foundation
-import OpenAPIRuntime
-import OpenAPIAsyncHTTPClient
-import OpenAPILoggingMiddleware
-import BearerTokenAuthMiddleware
-
-public actor ApiClient {
-    public var client: Client
-
-    public init(environment: ServerEnvironment) async throws {
-        let authMiddleware = BearerTokenAuthenticationMiddleware(
-            initialToken: await ApiClientState.shared.token,
-            skipAuthorization: { operationID in
-                await ApiClientState.shared.isPublicOperation(operationID)
-            }
-        )
-        
-        let loggingMiddleware = LoggingMiddleware(appName: "NSSpainAPI", logPrefix: "🚚 APIClient: ")
-        
-        let serverURL = try environment.getURL()
-        client = Client(
-            serverURL: serverURL,
-            transport: AsyncHTTPClientTransport(),
-            middlewares: [loggingMiddleware, authMiddleware]
-        )
+extension ApiServer {
+    public func someProtectedOperation(
+        _ input: Operations.SomeOp.Input
+    ) async throws -> Operations.SomeOp.Output {
+        guard let token = BearerTokenContext.token else {
+            throw Abort(.unauthorized)
+        }
+        // Validate `token` against your session store / signing key, then continue.
     }
 }
 ```
 
-This design allows you to toggle authentication and logging dynamically via a shared `ApiClientState` actor.
+## Server-side configuration
 
----
-
-## 🧰 API Reference
-
-### `init(initialToken:skipAuthorization:)`
-
-Creates a new middleware.
-
-| Parameter | Description |
-|------------|-------------|
-| `initialToken` | The initial bearer token (without “Bearer” prefix). |
-| `skipAuthorization` | Closure that determines whether to skip adding the header for a given `operationID`. Defaults to `false` for all. |
-
-### `func updateToken(_ newToken: String?)`
-
-Updates the current bearer token. Thread-safe and async-safe.
-
----
-
-## ✅ Example Output
-
-```
-[POST] /api/user/profile (200 OK)
-Authorization: Bearer 9b0f0d9e-XXXX-XXXX-XXXX-XXXXXXXXXXXX
-Duration: 120 ms
+```swift
+public init(
+    mode: AuthMode = .none,
+    publicEndpoints: Set<String> = BearerTokenAuthServerMiddleware.defaultPublicEndpoints,
+    publicPathPrefixes: Set<String> = [],
+    validation: ValidationStrategy = .auto
+)
 ```
 
----
+| Parameter | Default | Notes |
+|---|---|---|
+| `mode` | `.none` | Use `.uuid` for DB-session tokens, `.jwt` for signed JWTs. `.none` makes the middleware a passthrough. |
+| `publicEndpoints` | `["/health", "/healthz", "/ready", "/readyz", "/metrics"]` | Exact-path bypass list. Pass `[]` to require auth on every endpoint. |
+| `publicPathPrefixes` | `[]` | Boundary-anchored prefix matching. `["/admin"]` matches `/admin` and `/admin/x` but **not** `/administrator`. Trailing slash is normalised. |
+| `validation` | `.auto` | Resolves to `.uuidShape` for `.uuid`, `.jwtShape` for `.jwt`, `.none` for `.none`. Override with any explicit case. |
 
-## 🧪 Tests & Stability
+### Validation strategies
 
-- 100% Swift Concurrency–safe (`Sendable`, `actor` isolation)
-- Zero dependencies
-- Designed for Swift 6.0+ toolchains
-- Compatible with `OpenAPIRuntime`, `OpenAPIVapor`, and `OpenAPIAsyncHTTPClient`
+| `ValidationStrategy` | Behaviour |
+|---|---|
+| `.auto` | Picks based on `mode`. The default. |
+| `.none` | Skip validation entirely. The only thrown case is `BearerTokenAuthServerError.missingToken`. |
+| `.jwtShape` | Token must be three non-empty Base64URL segments separated by `.`. **Does not verify the signature.** |
+| `.uuidShape` | Token must be a canonical 8-4-4-4-12 UUID string (case-insensitive). |
+| `.custom(Validator)` | User-supplied async closure. Throw to reject; return to allow. The right place for DB session lookup, JWT signature + claim verification, etc. |
 
----
+## Error model
 
-## 📄 License
+Two typed cases, both conform to `AbortError` so Vapor returns HTTP 401 with reason `"Unauthorized"` (OWASP — same external message regardless of which sub-failure tripped):
 
-MIT License © 2025 [Mihaela Mihaljević Jakić](https://github.com/mihaelamj)
+```swift
+public enum BearerTokenAuthServerError: Error, AbortError {
+    case missingToken    // no usable bearer token on a protected route
+    case invalidToken    // present but the validation strategy rejected it
+}
+```
 
----
+| Caller sent | Thrown |
+|---|---|
+| nothing on `Authorization` | `.missingToken` |
+| `Authorization: Bearer ` (empty value) | `.missingToken` |
+| `Authorization: Basic ...` / Digest / etc. | `.missingToken` |
+| `Authorization: Bearer <bad-shape>` | `.invalidToken` |
+| `Authorization: Bearer <good-shape>` | (no error) |
 
-> “Clean code should be composable, testable, and visible when it runs.”
+A `.custom` validator may throw any `Error` — for example `Abort(.forbidden)` — and that error propagates unchanged through the middleware, so callers can surface different HTTP statuses.
+
+## What the middleware does NOT do
+
+The bundled validators are **shape-only**. The middleware deliberately does not:
+
+- Verify a JWT's signature (needs the signing key — use `.custom` with `JWTKit` or similar).
+- Check `exp`, `nbf`, or `iat` claims (must happen alongside signature verification — same place).
+- Look up UUID sessions in a database (needs DB access — same place).
+
+These all live in `.custom(Validator)` because they need per-project context the middleware cannot have.
+
+```swift
+let strict = BearerTokenAuthServerMiddleware(
+    mode: .jwt,
+    validation: .custom { token in
+        // your JWTKit verifier here — verifies signature, exp, iss, aud
+        try await jwtSigners.verify(token, as: AccessTokenPayload.self)
+    }
+)
+```
+
+## Companion: `AuthMode`
+
+Shared between client and server so both sides agree on what the token *is*:
+
+```swift
+public enum AuthMode: String, Sendable {
+    case none   // no auth headers
+    case uuid   // UUID session tokens, validated against your session store
+    case jwt    // signed JWTs, verified against your signing key
+}
+```
+
+Mixing modes (`.none` client talking to `.uuid` server, for example) fails closed — the server returns 401 because the client never sent a token.
+
+## Companion: `BearerTokenContext`
+
+A `@TaskLocal` for handlers that don't see Vapor's `Request`:
+
+```swift
+public enum BearerTokenContext {
+    @TaskLocal public static var token: String?
+}
+```
+
+The server middleware sets this inside its `withValue` block so every async handler executed during the request can read `BearerTokenContext.token`.
+
+## Documentation
+
+DocC is enabled. Generate the archive locally with:
+
+```bash
+swift package --allow-writing-to-directory ./docs generate-documentation \
+    --target BearerTokenAuthServerMiddleware \
+    --output-path ./docs/server.doccarchive
+```
+
+Open the archive in Xcode (or use `xcrun docc preview-documentation`) to browse types, see Topics groupings, and follow cross-references between `BearerTokenAuthServerMiddleware` ↔ `AuthMode` ↔ `BearerTokenContext` ↔ `BearerTokenAuthServerError`.
+
+## Architecture
+
+```
+Client side (OpenAPI):
+  Request → BearerTokenAuthenticationMiddleware → next → Server
+            (stamps Authorization)
+
+Server side (Vapor):
+  Request → ClientIpMiddleware (optional, separate package)
+          → BearerTokenAuthServerMiddleware
+            (extracts token, enforces presence, runs ValidationStrategy,
+             stashes on BearerTokenContext.token via TaskLocal)
+          → OpenAPI handlers (read BearerTokenContext.token to validate
+            against DB / signing key)
+```
+
+## Testing
+
+The package ships **58 tests across 13 suites**:
+
+| Area | Tests |
+|---|---|
+| Client middleware | 8 |
+| Server core (modes, defaults, propagation) | 13 |
+| Path-prefix boundary matching | 5 |
+| Path-prefix init normalization | 1 |
+| Non-Bearer Authorization schemes | 3 |
+| HTTP methods (POST/PUT/PATCH/DELETE) | 4 |
+| Auto-picked validation strategy | 3 |
+| `.custom(Validator)` | 5 |
+| `.jwtShape` | 4 |
+| `.uuidShape` | 3 |
+| Typed errors | 5 |
+| `AuthMode` | 3 |
+| `BearerTokenContext` | 4 |
+
+Run them with `swift test`.
+
+## License
+
+Apache 2.0 — see [LICENSE](LICENSE).

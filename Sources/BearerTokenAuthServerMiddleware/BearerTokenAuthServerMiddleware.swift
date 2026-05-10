@@ -21,7 +21,7 @@ import Vapor
 /// - ``AuthMode/none``: never throws. Token (if any) is propagated to
 ///   ``BearerTokenContext/token`` and the request continues.
 /// - ``AuthMode/uuid`` or ``AuthMode/jwt`` on a public route
-///   (``publicEndpoints`` exact match, or under ``publicPathPrefixes``):
+///   (`publicEndpoints` exact match, or under `publicPathPrefixes`):
 ///   never throws. Same passthrough as ``AuthMode/none``.
 /// - ``AuthMode/uuid`` or ``AuthMode/jwt`` on a protected route:
 ///   - **No usable token** → throws
@@ -52,6 +52,21 @@ import Vapor
 ///
 /// Boundary-anchored: `["/admin"]` and `["/admin/"]` both match `/admin`
 /// and `/admin/anything` but neither matches `/administrator`.
+///
+/// ## Topics
+///
+/// ### Configuring the middleware
+/// - ``init(mode:publicEndpoints:publicPathPrefixes:validation:)``
+/// - ``defaultPublicEndpoints``
+///
+/// ### Validation strategies
+/// - ``ValidationStrategy``
+/// - ``Validator``
+///
+/// ### Companion types
+/// - ``AuthMode``
+/// - ``BearerTokenContext``
+/// - ``BearerTokenAuthServerError``
 public struct BearerTokenAuthServerMiddleware: AsyncMiddleware {
 
     /// User-supplied closure type for ``ValidationStrategy/custom(_:)``.
