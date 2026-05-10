@@ -174,6 +174,34 @@ public enum AuthMode: String, Sendable {
 
 Mixing modes (`.none` client talking to `.uuid` server, for example) fails closed — the server returns 401 because the client never sent a token.
 
+## Companion packages
+
+- [`mihaelamj/ClientIpMiddleware`](https://github.com/mihaelamj/ClientIpMiddleware)
+  — Vapor `AsyncMiddleware` that captures the client IP (with
+  `trustedProxyHops` X-Forwarded-For trust model) and User-Agent into
+  task-locals so OpenAPI-generated handlers can read them.
+- [`mihaelamj/OpenAPILoggingMiddleware`](https://github.com/mihaelamj/OpenAPILoggingMiddleware)
+  — request/response logging on both client and server sides, with
+  default header redaction so this middleware's tokens don't accidentally
+  reach log files.
+- [`mihaelamj/swift-server-middleware-petshop`](https://github.com/mihaelamj/swift-server-middleware-petshop)
+  — end-to-end integration tests for all three middlewares composed
+  inside a real Vapor + OpenAPI 3.1 app, with macOS + Linux CI.
+
+## Platform support
+
+The package ships **two products** with different platform matrices:
+
+| Product | macOS | iOS / tvOS / watchOS | Linux |
+|---|---|---|---|
+| `BearerTokenAuthMiddleware` (client; OpenAPIRuntime) | ✅ swift test | ✅ xcodebuild build | ✅ swift test |
+| `BearerTokenAuthServerMiddleware` (server; Vapor) | ✅ swift test | ❌ Vapor unsupported | ✅ swift test |
+
+Vapor does not ship for iOS/tvOS/watchOS; consumers on those platforms
+should pull only the client product. CI runs the full `swift test` on
+macOS + Linux and `xcodebuild build` of the client product on iOS, tvOS,
+and watchOS Simulator.
+
 ## Companion: `BearerTokenContext`
 
 A `@TaskLocal` for handlers that don't see Vapor's `Request`:
@@ -216,7 +244,7 @@ Server side (Vapor):
 
 ## Testing
 
-The package ships **64 tests across 13 suites**:
+The package ships **78 tests across 14 suites**:
 
 | Area | Tests |
 |---|---|
@@ -233,6 +261,7 @@ The package ships **64 tests across 13 suites**:
 | Typed errors | 5 |
 | `AuthMode` | 3 |
 | `BearerTokenContext` | 4 |
+| Adversarial / malformed inputs (empty/whitespace tokens, 10 KB token, JWT shape edges, UUID edges, path-prefix safety, multiple `Authorization` headers, custom `Abort(.forbidden)`, 100-fold concurrent burst) | 14 |
 
 Run them with `swift test`.
 
