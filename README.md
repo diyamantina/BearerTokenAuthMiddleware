@@ -1,14 +1,23 @@
 # BearerTokenAuthMiddleware
 
+[![Tests](https://github.com/mihaelamj/BearerTokenAuthMiddleware/actions/workflows/test.yml/badge.svg)](https://github.com/mihaelamj/BearerTokenAuthMiddleware/actions/workflows/test.yml)
 ![Swift 6.0+](https://img.shields.io/badge/Swift-6.0+-orange.svg)
 ![Platforms](https://img.shields.io/badge/Platforms-macOS%20%7C%20iOS%20%7C%20Linux-blue.svg)
 
-Two complementary middlewares for Swift services that speak OpenAPI:
+Bearer-token middleware for Swift OpenAPI clients and Vapor-backed OpenAPI
+servers.
 
-- **`BearerTokenAuthMiddleware`** — client-side. Stamps `Authorization: Bearer <token>` on outbound OpenAPI requests, with per-operation skip filtering. Pure `OpenAPIRuntime`, safe on iOS.
-- **`BearerTokenAuthServerMiddleware`** — server-side. Vapor `AsyncMiddleware` that conditionally enforces token presence, optionally runs structural validation (JWT shape / UUID shape / custom closure), and propagates the token via a `TaskLocal` so OpenAPI-generated handlers (which never see Vapor's `Request`) can read it.
+The package contains two products:
 
-Both products live in the same package; pick the one(s) you need per target.
+- `BearerTokenAuthMiddleware`: client-side OpenAPI middleware that stamps
+  `Authorization: Bearer <token>` onto generated client requests.
+- `BearerTokenAuthServerMiddleware`: Vapor `AsyncMiddleware` that extracts and
+  enforces bearer tokens before generated OpenAPI handlers run.
+
+Use the client product in Apple-platform apps, server-to-server clients, or any
+target built around `swift-openapi-runtime`. Use the server product when a Vapor
+transport needs to protect generated OpenAPI handlers without passing Vapor's
+`Request` through every operation.
 
 ## Installation
 
@@ -17,7 +26,7 @@ Both products live in the same package; pick the one(s) you need per target.
 ```
 
 ```swift
-// iOS / macOS app target — only needs the client product
+// iOS / macOS app target: client product only.
 .target(
     name: "MyApp",
     dependencies: [
@@ -25,7 +34,7 @@ Both products live in the same package; pick the one(s) you need per target.
     ]
 ),
 
-// Vapor server target — needs the server product
+// Vapor server target: server product.
 .target(
     name: "MyApi",
     dependencies: [
@@ -35,9 +44,7 @@ Both products live in the same package; pick the one(s) you need per target.
 ),
 ```
 
-## Quick start
-
-### Client (iOS / macOS / server-to-server)
+## Client Quick Start
 
 ```swift
 import BearerTokenAuthMiddleware
@@ -45,8 +52,8 @@ import OpenAPIAsyncHTTPClient
 
 let auth = BearerTokenAuthenticationMiddleware(
     initialToken: nil,
-    skipAuthorization: { opID in
-        ["login", "refreshToken", "getHealth"].contains(opID)
+    skipAuthorization: { operationID in
+        ["login", "refreshToken", "getHealth"].contains(operationID)
     }
 )
 
@@ -56,26 +63,38 @@ let client = Client(
     middlewares: [auth]
 )
 
-// Later, after a successful login:
+// After login or token refresh:
 auth.updateToken(loginResponse.accessToken)
+
+// On logout:
+auth.updateToken(nil)
 ```
 
-### Server (Vapor)
+The token is stored behind an actor, so it can be updated at runtime without
+rebuilding the generated client.
+
+## Server Quick Start
 
 ```swift
 import BearerTokenAuthServerMiddleware
 import Vapor
 
-// One-liner: JWT shape validation + health-endpoint exemption + bearer enforcement
 app.middleware.use(BearerTokenAuthServerMiddleware(mode: .jwt))
 ```
 
-That's a fully-configured middleware. The `validation: .auto` default resolves to `.jwtShape`, the default `publicEndpoints` exempt `/health`, `/healthz`, `/ready`, `/readyz`, `/metrics`, and any other route that lacks a Bearer header gets a 401.
+That single line:
 
-OpenAPI-generated handlers can read the extracted token:
+- Exempts the default health, readiness, and metrics endpoints.
+- Requires a bearer token everywhere else.
+- Runs JWT shape validation by default.
+- Stores the extracted token in `BearerTokenContext.token` for downstream
+  generated handlers.
+
+Generated handlers can read the token without seeing Vapor's `Request`:
 
 ```swift
 import BearerTokenAuthServerMiddleware
+import Vapor
 
 extension ApiServer {
     public func someProtectedOperation(
@@ -84,12 +103,13 @@ extension ApiServer {
         guard let token = BearerTokenContext.token else {
             throw Abort(.unauthorized)
         }
-        // Validate `token` against your session store / signing key, then continue.
+
+        // Verify against your session store, JWT verifier, or authorization layer.
     }
 }
 ```
 
-## Server-side configuration
+## Server Configuration
 
 ```swift
 public init(
@@ -101,110 +121,54 @@ public init(
 )
 ```
 
-| Parameter | Default | Notes |
+| Parameter | Default | Purpose |
 |---|---|---|
-| `mode` | `.none` | Use `.uuid` for DB-session tokens, `.jwt` for signed JWTs. `.none` makes the middleware a passthrough. |
-| `publicEndpoints` | `["/health", "/healthz", "/ready", "/readyz", "/metrics"]` | Exact-path bypass list. Pass `[]` to require auth on every endpoint. |
-| `publicPathPrefixes` | `[]` | Boundary-anchored prefix matching. `["/admin"]` matches `/admin` and `/admin/x` but **not** `/administrator`. Trailing slash is normalised. |
-| `validation` | `.auto` | Resolves to `.uuidShape` for `.uuid`, `.jwtShape` for `.jwt`, `.none` for `.none`. Override with any explicit case. |
-| `propagateTokenOnPublicRoutes` | `false` | When the request bypasses enforcement (a public-endpoint or public-prefix match, or `.none` mode), keep `BearerTokenContext.token` `nil` so handlers and downstream loggers cannot accidentally see a token the operator declared they shouldn't. Set to `true` to surface the inbound token (pre-2.x behaviour). |
+| `mode` | `.none` | `.none` passes through, `.uuid` expects UUID session tokens, `.jwt` expects JWT-shaped tokens. |
+| `publicEndpoints` | health, readiness, metrics paths | Exact paths that bypass enforcement. Pass `[]` to require auth everywhere. |
+| `publicPathPrefixes` | `[]` | Boundary-anchored public subtrees. `["/admin"]` matches `/admin` and `/admin/x`, not `/administrator`. |
+| `validation` | `.auto` | Chooses `.uuidShape` for `.uuid`, `.jwtShape` for `.jwt`, and `.none` for `.none`. |
+| `propagateTokenOnPublicRoutes` | `false` | Keeps `BearerTokenContext.token` empty on public routes unless explicitly opted in. |
 
-### Validation strategies
+## Validation Strategies
 
-| `ValidationStrategy` | Behaviour |
+The built-in validators are intentionally shape-only:
+
+| Strategy | Behavior |
 |---|---|
-| `.auto` | Picks based on `mode`. The default. |
-| `.none` | Skip validation entirely. The only thrown case is `BearerTokenAuthServerError.missingToken`. |
-| `.jwtShape` | Token must be three non-empty Base64URL segments separated by `.`. **Does not verify the signature.** |
-| `.uuidShape` | Token must be a canonical 8-4-4-4-12 UUID string (case-insensitive). |
-| `.custom(Validator)` | User-supplied async closure. Throw to reject; return to allow. The right place for DB session lookup, JWT signature + claim verification, etc. |
-
-## Error model
-
-Two typed cases, both conform to `AbortError` so Vapor returns HTTP 401 with reason `"Unauthorized"` (OWASP — same external message regardless of which sub-failure tripped):
-
-```swift
-public enum BearerTokenAuthServerError: Error, AbortError {
-    case missingToken    // no usable bearer token on a protected route
-    case invalidToken    // present but the validation strategy rejected it
-}
-```
-
-| Caller sent | Thrown |
-|---|---|
-| nothing on `Authorization` | `.missingToken` |
-| `Authorization: Bearer ` (empty value) | `.missingToken` |
-| `Authorization: Basic ...` / Digest / etc. | `.missingToken` |
-| `Authorization: Bearer <bad-shape>` | `.invalidToken` |
-| `Authorization: Bearer <good-shape>` | (no error) |
-
-A `.custom` validator may throw any `Error` — for example `Abort(.forbidden)` — and that error propagates unchanged through the middleware, so callers can surface different HTTP statuses.
-
-## What the middleware does NOT do
-
-The bundled validators are **shape-only**. The middleware deliberately does not:
-
-- Verify a JWT's signature (needs the signing key — use `.custom` with `JWTKit` or similar).
-- Check `exp`, `nbf`, or `iat` claims (must happen alongside signature verification — same place).
-- Look up UUID sessions in a database (needs DB access — same place).
-
-These all live in `.custom(Validator)` because they need per-project context the middleware cannot have.
+| `.auto` | Picks from `mode`. |
+| `.none` | Only checks that a token is present on protected routes. |
+| `.jwtShape` | Requires three non-empty Base64URL segments separated by dots. Does not verify signatures or claims. |
+| `.uuidShape` | Requires a canonical UUID string. |
+| `.custom(Validator)` | Runs your async validator. Use this for DB session lookup or real JWT verification. |
 
 ```swift
 let strict = BearerTokenAuthServerMiddleware(
     mode: .jwt,
     validation: .custom { token in
-        // your JWTKit verifier here — verifies signature, exp, iss, aud
         try await jwtSigners.verify(token, as: AccessTokenPayload.self)
     }
 )
 ```
 
-## Companion: `AuthMode`
+## Error Model
 
-Shared between client and server so both sides agree on what the token *is*:
+Server-side failures use typed errors that conform to `AbortError`:
 
 ```swift
-public enum AuthMode: String, Sendable {
-    case none   // no auth headers
-    case uuid   // UUID session tokens, validated against your session store
-    case jwt    // signed JWTs, verified against your signing key
+public enum BearerTokenAuthServerError: Error, AbortError {
+    case missingToken
+    case invalidToken
 }
 ```
 
-Mixing modes (`.none` client talking to `.uuid` server, for example) fails closed — the server returns 401 because the client never sent a token.
+Both return HTTP 401 with the external reason `"Unauthorized"`. Custom
+validators may throw any error, such as `Abort(.forbidden)`, and that error
+passes through unchanged.
 
-## Companion packages
+## Task-Local Token
 
-- [`mihaelamj/ClientIpMiddleware`](https://github.com/mihaelamj/ClientIpMiddleware)
-  — Vapor `AsyncMiddleware` that captures the client IP (with
-  `trustedProxyHops` X-Forwarded-For trust model) and User-Agent into
-  task-locals so OpenAPI-generated handlers can read them.
-- [`mihaelamj/OpenAPILoggingMiddleware`](https://github.com/mihaelamj/OpenAPILoggingMiddleware)
-  — request/response logging on both client and server sides, with
-  default header redaction so this middleware's tokens don't accidentally
-  reach log files.
-- [`mihaelamj/swift-server-middleware-petshop`](https://github.com/mihaelamj/swift-server-middleware-petshop)
-  — end-to-end integration tests for all three middlewares composed
-  inside a real Vapor + OpenAPI 3.1 app, with macOS + Linux CI.
-
-## Platform support
-
-The package ships **two products** with different platform matrices:
-
-| Product | macOS | iOS / tvOS / watchOS | Linux |
-|---|---|---|---|
-| `BearerTokenAuthMiddleware` (client; OpenAPIRuntime) | ✅ swift test | ✅ xcodebuild build | ✅ swift test |
-| `BearerTokenAuthServerMiddleware` (server; Vapor) | ✅ swift test | ❌ Vapor unsupported | ✅ swift test |
-
-Vapor does not ship for iOS/tvOS/watchOS; consumers on those platforms
-should pull only the client product. CI runs the full `swift test` on
-macOS + Linux and `xcodebuild build` of the client product on iOS, tvOS,
-and watchOS Simulator.
-
-## Companion: `BearerTokenContext`
-
-A `@TaskLocal` for handlers that don't see Vapor's `Request`:
+`BearerTokenContext` exposes the token to handlers that do not receive Vapor's
+`Request`:
 
 ```swift
 public enum BearerTokenContext {
@@ -212,11 +176,46 @@ public enum BearerTokenContext {
 }
 ```
 
-The server middleware sets this inside its `withValue` block so every async handler executed during the request can read `BearerTokenContext.token`.
+By default, public routes and `.none` mode do not propagate inbound tokens into
+this task-local. Set `propagateTokenOnPublicRoutes: true` only when handlers on
+public routes explicitly need to inspect an optional token.
+
+## Architecture
+
+```text
+Client side:
+  Generated Client
+    -> BearerTokenAuthenticationMiddleware
+    -> transport
+
+Server side:
+  Vapor Request
+    -> BearerTokenAuthServerMiddleware
+    -> generated OpenAPI handler
+       reads BearerTokenContext.token
+```
+
+## Companion Packages
+
+- [`ClientIpMiddleware`](https://github.com/mihaelamj/ClientIpMiddleware)
+  captures client IP and user-agent context for generated OpenAPI handlers.
+- [`OpenAPILoggingMiddleware`](https://github.com/mihaelamj/OpenAPILoggingMiddleware)
+  logs OpenAPI requests and responses with default credential-header redaction.
+
+## Platform Support
+
+The package ships two products with different platform profiles:
+
+| Product | macOS | iOS / tvOS / watchOS | Linux |
+|---|---|---|---|
+| `BearerTokenAuthMiddleware` | `swift test` | client build verification | `swift test` |
+| `BearerTokenAuthServerMiddleware` | `swift test` | Not supported; Vapor is server-only | `swift test` |
+
+Consumers on Apple mobile platforms should depend on the client product only.
 
 ## Documentation
 
-DocC is enabled. Generate the archive locally with:
+DocC is enabled:
 
 ```bash
 swift package --allow-writing-to-directory ./docs generate-documentation \
@@ -224,49 +223,24 @@ swift package --allow-writing-to-directory ./docs generate-documentation \
     --output-path ./docs/server.doccarchive
 ```
 
-Open the archive in Xcode (or use `xcrun docc preview-documentation`) to browse types, see Topics groupings, and follow cross-references between `BearerTokenAuthServerMiddleware` ↔ `AuthMode` ↔ `BearerTokenContext` ↔ `BearerTokenAuthServerError`.
-
-## Architecture
-
-```
-Client side (OpenAPI):
-  Request → BearerTokenAuthenticationMiddleware → next → Server
-            (stamps Authorization)
-
-Server side (Vapor):
-  Request → ClientIpMiddleware (optional, separate package)
-          → BearerTokenAuthServerMiddleware
-            (extracts token, enforces presence, runs ValidationStrategy,
-             stashes on BearerTokenContext.token via TaskLocal)
-          → OpenAPI handlers (read BearerTokenContext.token to validate
-            against DB / signing key)
-```
-
 ## Testing
 
-The package ships **78 tests across 14 suites**:
+The package ships with **78 tests across 14 suites** covering:
 
-| Area | Tests |
-|---|---|
-| Client middleware | 8 |
-| Server core (modes, defaults, propagation, public-route opt-in) | 19 |
-| Path-prefix boundary matching | 5 |
-| Path-prefix init normalization | 1 |
-| Non-Bearer Authorization schemes | 3 |
-| HTTP methods (POST/PUT/PATCH/DELETE) | 4 |
-| Auto-picked validation strategy | 3 |
-| `.custom(Validator)` | 5 |
-| `.jwtShape` | 4 |
-| `.uuidShape` | 3 |
-| Typed errors | 5 |
-| `AuthMode` | 3 |
-| `BearerTokenContext` | 4 |
-| Adversarial / malformed inputs (empty/whitespace tokens, 10 KB token, JWT shape edges, UUID edges, path-prefix safety, multiple `Authorization` headers, custom `Abort(.forbidden)`, 100-fold concurrent burst) | 14 |
+- Client-side header stamping and operation skipping.
+- Server modes, default public endpoints, and public prefix matching.
+- JWT-shape and UUID-shape validation.
+- Custom validators and typed error behavior.
+- Task-local propagation and public-route non-propagation.
+- Adversarial inputs, large tokens, repeated authorization headers, and
+  concurrent request isolation.
 
-Run them with `swift test`.
+Run them with:
 
-CI runs the suite on macOS and on Linux (Swift 6.0 container).
+```bash
+swift test
+```
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0. See [LICENSE](LICENSE).
