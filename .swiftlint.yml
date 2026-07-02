@@ -1,0 +1,31 @@
+# SwiftLint configuration. https://github.com/realm/SwiftLint
+# A starting point; tune to your project, but keep it committed and run it with
+# --strict so warnings cannot accumulate.
+
+disabled_rules:
+  - todo
+
+opt_in_rules:
+  - empty_count
+  - explicit_init
+  - first_where
+  - force_unwrapping
+  - sorted_first_last
+  - unused_import
+
+line_length:
+  warning: 180
+  error: 220
+  ignores_comments: true
+  ignores_urls: true
+
+identifier_name:
+  min_length: 2
+
+type_name:
+  min_length: 2
+
+excluded:
+  - .build
+  - Packages/.build
+  - .git

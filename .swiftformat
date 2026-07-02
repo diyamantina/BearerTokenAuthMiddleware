@@ -1,0 +1,12 @@
+# SwiftFormat configuration. https://github.com/nicklockwood/SwiftFormat
+# This is a starting point; adjust to your project, but keep it committed so
+# every clone and CI run formats identically.
+
+--swiftversion 6.0
+--indent 4
+--maxwidth 180
+--commas always
+--self remove
+--importgrouping testable-bottom
+--trailingclosures
+--exclude .build,Packages/.build,.git
