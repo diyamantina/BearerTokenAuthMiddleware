@@ -1,6 +1,6 @@
 # BearerTokenAuthMiddleware
 
-[![Tests](https://github.com/mihaelamj/BearerTokenAuthMiddleware/actions/workflows/test.yml/badge.svg)](https://github.com/mihaelamj/BearerTokenAuthMiddleware/actions/workflows/test.yml)
+[![Tests](https://github.com/diyamantina/BearerTokenAuthMiddleware/actions/workflows/test.yml/badge.svg)](https://github.com/diyamantina/BearerTokenAuthMiddleware/actions/workflows/test.yml)
 ![Swift 6.0+](https://img.shields.io/badge/Swift-6.0+-orange.svg)
 ![Platforms](https://img.shields.io/badge/Platforms-macOS%20%7C%20iOS%20%7C%20Linux-blue.svg)
 
@@ -22,7 +22,7 @@ transport needs to protect generated OpenAPI handlers without passing Vapor's
 ## Installation
 
 ```swift
-.package(url: "https://github.com/mihaelamj/BearerTokenAuthMiddleware", from: "2.0.0"),
+.package(url: "https://github.com/diyamantina/BearerTokenAuthMiddleware", from: "2.0.0"),
 ```
 
 ```swift
@@ -197,9 +197,9 @@ Server side:
 
 ## Companion Packages
 
-- [`ClientIpMiddleware`](https://github.com/mihaelamj/ClientIpMiddleware)
+- [`ClientIpMiddleware`](https://github.com/diyamantina/ClientIpMiddleware)
   captures client IP and user-agent context for generated OpenAPI handlers.
-- [`OpenAPILoggingMiddleware`](https://github.com/mihaelamj/OpenAPILoggingMiddleware)
+- [`OpenAPILoggingMiddleware`](https://github.com/diyamantina/OpenAPILoggingMiddleware)
   logs OpenAPI requests and responses with default credential-header redaction.
 
 ## Platform Support
