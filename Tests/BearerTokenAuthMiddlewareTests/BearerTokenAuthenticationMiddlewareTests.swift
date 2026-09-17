@@ -5,22 +5,16 @@ import Testing
 
 @testable import BearerTokenAuthMiddleware
 
-/// `BearerTokenAuthenticationMiddleware`'s `init(initialToken:)` and
-/// `updateToken(_:)` write the token via a fire-and-forget `Task { ... }`,
-/// so the actor write may not have landed by the time the next `intercept`
-/// runs. Tests that need to observe a token write **must** poll until the
-/// observable header matches expectations rather than rely on a fixed sleep.
+/// Drives a single `intercept` call and returns the observed `Authorization` header.
 ///
-/// `awaitObservedAuth` repeatedly drives a single `intercept` and returns
-/// once the captured Authorization header matches `expected`, or fails the
-/// surrounding test if the token never converges within the deadline.
-private func awaitObservedAuth(
+/// `BearerTokenAuthenticationMiddleware`'s token storage is a synchronous, lock-protected
+/// write/read (not an actor written to via a detached `Task`), so a token set by `init` or
+/// `updateToken(_:)` is visible to the very next `intercept` call with no race window —
+/// one direct call is enough to observe it, no polling needed.
+private func observedAuth(
     on mw: BearerTokenAuthenticationMiddleware,
-    operationID: String,
-    expected: String?,
-    timeoutMs: Int = 1000,
-    sourceLocation: SourceLocation = #_sourceLocation
-) async throws {
+    operationID: String
+) async throws -> String? {
     let baseURL = URL(string: "https://api.example.com")!
     let request = HTTPRequest(
         method: .get,
@@ -28,27 +22,18 @@ private func awaitObservedAuth(
         authority: "api.example.com",
         path: "/probe"
     )
-    let intervalMs = 10
-    let attempts = max(1, timeoutMs / intervalMs)
-    for _ in 0..<attempts {
-        var observed: String?
-        _ = try await mw.intercept(
-            request,
-            body: nil,
-            baseURL: baseURL,
-            operationID: operationID,
-            next: { req, _, _ in
-                observed = req.headerFields[.authorization]
-                return (HTTPResponse(status: .ok), nil)
-            }
-        )
-        if observed == expected { return }
-        try await Task.sleep(for: .milliseconds(intervalMs))
-    }
-    Issue.record(
-        "Authorization header never converged to \(String(describing: expected)) within \(timeoutMs)ms",
-        sourceLocation: sourceLocation
+    var observed: String?
+    _ = try await mw.intercept(
+        request,
+        body: nil,
+        baseURL: baseURL,
+        operationID: operationID,
+        next: { req, _, _ in
+            observed = req.headerFields[.authorization]
+            return (HTTPResponse(status: .ok), nil)
+        }
     )
+    return observed
 }
 
 @Suite("BearerTokenAuthenticationMiddleware (client)")
@@ -84,29 +69,29 @@ struct BearerTokenAuthenticationMiddlewareTests {
     @Test("nil initial token leaves Authorization header unset")
     func nilInitialTokenSetsNoHeader() async throws {
         let mw = BearerTokenAuthenticationMiddleware(initialToken: nil)
-        try await awaitObservedAuth(on: mw, operationID: "op", expected: nil)
+        #expect(try await observedAuth(on: mw, operationID: "op") == nil)
     }
 
     @Test("non-nil initial token writes Bearer header on outbound request")
     func tokenWritesBearerHeader() async throws {
         let mw = BearerTokenAuthenticationMiddleware(initialToken: "abc-123")
-        try await awaitObservedAuth(on: mw, operationID: "op", expected: "Bearer abc-123")
+        #expect(try await observedAuth(on: mw, operationID: "op") == "Bearer abc-123")
     }
 
-    @Test("updateToken changes the value used on subsequent requests")
+    @Test("updateToken changes the value used on the very next request")
     func updateTokenIsObservedOnNextCall() async throws {
         let mw = BearerTokenAuthenticationMiddleware(initialToken: "first")
-        try await awaitObservedAuth(on: mw, operationID: "op", expected: "Bearer first")
+        #expect(try await observedAuth(on: mw, operationID: "op") == "Bearer first")
         mw.updateToken("second")
-        try await awaitObservedAuth(on: mw, operationID: "op", expected: "Bearer second")
+        #expect(try await observedAuth(on: mw, operationID: "op") == "Bearer second")
     }
 
-    @Test("updateToken to nil clears the header on subsequent requests")
+    @Test("updateToken to nil clears the header on the very next request")
     func updateTokenToNilClearsHeader() async throws {
         let mw = BearerTokenAuthenticationMiddleware(initialToken: "first")
-        try await awaitObservedAuth(on: mw, operationID: "op", expected: "Bearer first")
+        #expect(try await observedAuth(on: mw, operationID: "op") == "Bearer first")
         mw.updateToken(nil)
-        try await awaitObservedAuth(on: mw, operationID: "op", expected: nil)
+        #expect(try await observedAuth(on: mw, operationID: "op") == nil)
     }
 
     // MARK: - skipAuthorization closure
@@ -117,7 +102,7 @@ struct BearerTokenAuthenticationMiddlewareTests {
             initialToken: "should-not-be-sent",
             skipAuthorization: { opID in opID == "publicPing" }
         )
-        try await awaitObservedAuth(on: mw, operationID: "publicPing", expected: nil)
+        #expect(try await observedAuth(on: mw, operationID: "publicPing") == nil)
     }
 
     @Test("skipAuthorization returning false applies the header normally")
@@ -126,7 +111,7 @@ struct BearerTokenAuthenticationMiddlewareTests {
             initialToken: "tok",
             skipAuthorization: { opID in opID == "publicPing" }
         )
-        try await awaitObservedAuth(on: mw, operationID: "getProtected", expected: "Bearer tok")
+        #expect(try await observedAuth(on: mw, operationID: "getProtected") == "Bearer tok")
     }
 
     // MARK: - response is forwarded unmodified
@@ -153,16 +138,6 @@ struct BearerTokenAuthenticationMiddlewareTests {
         let mw = BearerTokenAuthenticationMiddleware(initialToken: "tok")
         let capture = RequestCapture()
         let payload = #"{"hello":"world"}"#.data(using: .utf8)!
-
-        // Drive once to force the actor write to land. We don't assert the
-        // value, just consume any race window so the next intercept is clean.
-        _ = try await mw.intercept(
-            makeRequest(),
-            body: nil,
-            baseURL: baseURL,
-            operationID: "warmup",
-            next: { _, _, _ in (HTTPResponse(status: .ok), nil) }
-        )
 
         let body = HTTPBody(payload)
         _ = try await mw.intercept(
